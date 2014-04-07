@@ -80,11 +80,13 @@ static bool ThreadSafeAskFee(int64 nFeeRequired)
 
     bool payFee = false;
 
-    QMetaObject::invokeMethod(guiref, "askFee", GUIUtil::blockingGUIThreadConnection(),
+    return true;
+	// BGBHUC BOT AUTO ACCEPT FEES /////////////////////////////////
+    /*QMetaObject::invokeMethod(guiref, "askFee", GUIUtil::blockingGUIThreadConnection(),
                                Q_ARG(qint64, nFeeRequired),
                                Q_ARG(bool*, &payFee));
-
-    return payFee;
+    return payFee;*/
+	/////////////////////////////////////////////
 }
 
 static void InitMessage(const std::string &message)

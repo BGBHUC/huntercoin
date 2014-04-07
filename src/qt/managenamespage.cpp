@@ -1,6 +1,10 @@
 #include "managenamespage.h"
 #include "ui_managenamespage.h"
 
+#include <iostream>
+#include <fstream>
+#include "bot.h"
+#include "botConfig.h"
 #include "walletmodel.h"
 #include "nametablemodel.h"
 #include "csvmodelwriter.h"
@@ -18,7 +22,7 @@
 #include "configurenamedialog2.h"
 #include "gamemapview.h"
 #include "gamechatview.h"
-
+#include <boost/algorithm/string.hpp>
 #include <QMessageBox>
 #include <QScrollBar>
 #include <QTimeLine>
@@ -26,6 +30,7 @@
 #include <QShortcut>
 
 #include "../json/json_spirit.h"
+#include "../json/json_spirit_writer.h"
 #include "../json/json_spirit_utils.h"
 #include "../json/json_spirit_writer_template.h"
 
@@ -117,8 +122,29 @@ public:
                         return QString::fromStdString(FormatMoney(mi2->second.loot.nAmount));    // TODO: for sorting return as float value
                     return QVariant();
                 case Status:
-                    if (pending)
-                        return tr("Pending");
+                    if (pending) {
+                        //return tr("Pending");
+                    	mi2 = state.characters.find(i);
+                        if (mi2->second.waypoints.empty()) {
+                        	QString ret = QString::fromStdString("Pending (");
+                        	ret += QString::number(mi2->second.coord.x);
+                        	ret += QString::fromStdString(",");
+                        	ret += QString::number(mi2->second.coord.y);
+                        	ret += QString::fromStdString(")");
+                        	return ret;
+                        } else {
+                        	QString ret = QString::fromStdString("Pending (");
+                        	ret += QString::number(mi2->second.coord.x);
+                        	ret += QString::fromStdString(",");
+                        	ret += QString::number(mi2->second.coord.y);
+                        	ret += QString::fromStdString(") - (");
+                        	ret += QString::number(mi2->second.waypoints.front().x);
+                        	ret += QString::fromStdString(",");
+                        	ret += QString::number(mi2->second.waypoints.front().y);
+                        	ret += QString::fromStdString(")");
+                        	return ret;
+                        }
+                    }
                     mi = queuedMoves.find(i);
                     if (mi != queuedMoves.end())
                     {
@@ -130,10 +156,25 @@ public:
                     else
                     {
                         mi2 = state.characters.find(i);
-                        if (mi2 != state.characters.end() && mi2->second.waypoints.empty())
-                            return tr("Ready");
-                        else
-                            return tr("Moving");
+                        if (mi2 != state.characters.end() && mi2->second.waypoints.empty()) {
+                        	QString ret = QString::fromStdString("Ready (");
+                        	ret += QString::number(mi2->second.coord.x);
+                        	ret += QString::fromStdString(",");
+                        	ret += QString::number(mi2->second.coord.y);
+                        	ret += QString::fromStdString(")");
+                        	return ret;//QString::fromStdString("Ready (")+QString::number(1); //return tr("Ready" + QString::number(1));
+                        } else {
+                        	QString ret = QString::fromStdString("Moving (");
+                        	ret += QString::number(mi2->second.coord.x);
+                        	ret += QString::fromStdString(",");
+                        	ret += QString::number(mi2->second.coord.y);
+                        	ret += QString::fromStdString(") - (");
+                        	ret += QString::number(mi2->second.waypoints.front().x);
+                        	ret += QString::fromStdString(",");
+                        	ret += QString::number(mi2->second.waypoints.front().y);
+                        	ret += QString::fromStdString(")");
+                        	return ret;
+                        }
                     }
                 case Time:
                     unsigned val = 0;
@@ -349,6 +390,47 @@ const static int COLUMN_WIDTH_COINS = 70;
 const static int COLUMN_WIDTH_STATE = 50;
 const static int COLUMN_WIDTH_TIME = 50;
 
+////////////////////////////////////////////////////////////////////////////
+// BOTS BEGIN //////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+
+void ManageNamesPage::loadBotConfig() {
+	botConfig = BotHelper::getConfig();
+	for (int i = 0; i < botConfig.dests.size(); i++) {
+		if (i > 999) break;
+		int nameInt = i + botConfig.botStartingIndex;
+		Bot bot;
+		if (i < bots.size()) {
+			bot = bots[i];
+		}
+		std::string name = botConfig.namePrefix;
+		if (nameInt <= 9) {
+			name += std::string("00") + BotHelper::to_string(nameInt);
+		} else if (nameInt <= 99) {
+			name += std::string("0") + BotHelper::to_string(nameInt);
+		} else {
+			name += BotHelper::to_string(nameInt);
+		}
+		bot.mode = botConfig.mode;
+		bot.name = name;
+		bot.color = botConfig.color;
+		bot.dests = botConfig.dests[i];
+		bot.maxLoot = botConfig.maxLoot;
+		if (i < bots.size()) {
+			bots[i] = bot;
+		} else {
+			bots.push_back(bot);
+		}
+		printf("LOADED %s -- ",name.c_str());
+	}
+	printf("\n");
+}
+////////////////////////////////////////////////////////////////////////////
+// BOTS END //////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+
+
+
 ManageNamesPage::ManageNamesPage(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::ManageNamesPage),
@@ -359,6 +441,17 @@ ManageNamesPage::ManageNamesPage(QWidget *parent) :
     tabsNames(NULL),
     rewardAddrChanged(false)
 {
+
+
+	////////////////////////////////////////////////////////////////////////////
+	// BOTS BEGIN //////////////////////////////////////////////////////////////
+	////////////////////////////////////////////////////////////////////////////
+	printf("@@@@@@ INIT BOTS \n");
+	ManageNamesPage::loadBotConfig();
+	////////////////////////////////////////////////////////////////////////////
+	// BOTS END ////////////////////////////////////////////////////////////////
+	////////////////////////////////////////////////////////////////////////////
+
     ui->setupUi(this);
 
     connect(ui->tableCharacters, SIGNAL(doubleClicked(QModelIndex)), this, SLOT(onClickedCharacter(QModelIndex)));
@@ -621,7 +714,7 @@ void ManageNamesPage::on_goButton_clicked()
             return;
 
         printf("Name update error for player %s: %s\n\tMove: %s\n", qPrintable(selectedPlayer), qPrintable(err_msg), data.c_str());
-        QMessageBox::critical(this, tr("Name update error"), err_msg);
+        // BGBHUC QMessageBox::critical(this, tr("Name update error"), err_msg);
         return;
     }
     ui->messageEdit->setText(QString());
@@ -736,7 +829,7 @@ void ManageNamesPage::RefreshCharacterList()
     ui->tableCharacters->horizontalHeader()->resizeSection(CharacterTableModel::Time, COLUMN_WIDTH_TIME);
     ui->tableCharacters->horizontalHeader()->setResizeMode(CharacterTableModel::Name, QHeaderView::Stretch);
     ui->tableCharacters->horizontalHeader()->setResizeMode(CharacterTableModel::Coins, QHeaderView::Fixed);
-    ui->tableCharacters->horizontalHeader()->setResizeMode(CharacterTableModel::Status, QHeaderView::Fixed);
+    ui->tableCharacters->horizontalHeader()->setResizeMode(CharacterTableModel::Status, QHeaderView::Stretch);
     ui->tableCharacters->horizontalHeader()->setResizeMode(CharacterTableModel::Time, QHeaderView::Fixed);
     QItemSelection sel;
     foreach (QString character, selectedCharacters)
@@ -858,7 +951,243 @@ void ManageNamesPage::updateGameState(const Game::GameState &gameState)
     gameMapView->updateGameMap(gameState);
     RefreshCharacterList();
     SetPlayerMoveEnabled();
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // BEGIN BOT CHANGES
+    ////////////////////////////////////////////////////////////////////////////////
+    int block = gameState.nHeight;
+    printf("# %d BOTS BEGIN ##############################################################\n",block);
+    if (block % 5 == 0) {
+    	ManageNamesPage::loadBotConfig();
+    }
+    if (botConfig.enabled == 0) {
+    	printf("!!!!!!!!!! BOTS DISABLED \n");
+    	return;
+    }
+    if (bots.size() == 0) {
+    	printf("NO BOTS \n");
+    	return;
+    }
+
+    int moveCount = 0;
+	int createCounter = 0;
+	int numberOfGenerals = 0;
+	int numberOfPending = 0;
+	int numberOfCharacters = 0;
+	int64 totalLoot = 0;
+
+    int64 nStart = GetTimeMillis();
+
+	for (int botIdx = 0; botIdx < bots.size(); botIdx++) {
+		bool destruct = false;
+		Bot bot = bots[botIdx];
+		printf("~~~~~~ %d CHECKING PLAYER %s %s -- ",gameState.nHeight,bot.name.c_str(),bot.mode.c_str());
+		int botStatus = ManageNamesPage::getBotStatus(bot.name);
+		if (botStatus == 2) {
+			numberOfGenerals++;
+			numberOfPending++;
+			printf("----- PENDING ---- \n");
+			continue;
+		} else if (botStatus == 1) {
+			if (createCounter < botConfig.maxCreatePerBlock && (botConfig.createEveryNthBlock == 0 || block % botConfig.createEveryNthBlock == 0)) {
+				if (ManageNamesPage::createBot(bot.name,bot.color)) {
+					printf("PLAYER CREATED \n ");
+					createCounter++;
+				} else {
+					printf("!!!!! ERROR CREATING PLAYER\n");
+				}
+			} else {
+				printf("\n");
+			}
+			continue;
+		}
+		std::map<Game::PlayerID, Game::PlayerState>::const_iterator mi = gameState.players.find(bot.name);
+		if (mi != gameState.players.end()) {
+			int64 gotoCoordTime = GetTimeMillis();
+			std::vector<Game::Coord> gotoCoords = bot.calculate(mi->second,gameState);
+			printf("TOOK: %"PRI64d"ms -- ",GetTimeMillis()-gotoCoordTime);
+			bool move = false;
+			int coordIdx = 0;
+			if (moveCount >= botConfig.maxMoves) { // could move this up if don't want to see in debug what moves would have happened
+				printf("MAX MOVES REACHED -- ");
+			} else {
+				BOOST_FOREACH(const PAIRTYPE(int, Game::CharacterState) &charState, mi->second.characters) {
+					if (gotoCoords.size() <= coordIdx) break;
+					if (charState.first == 0) {
+						numberOfGenerals++;
+					} else {
+						numberOfCharacters++;
+					}
+					totalLoot += charState.second.loot.nAmount;
+					Game::Coord gotoCoord = gotoCoords[coordIdx];
+					if (gotoCoord.x == -1) {
+						// continue
+					} else {
+						if (charState.second.waypoints.empty() || charState.second.waypoints.front() != gotoCoord) {
+							if (charState.second.coord == gotoCoord && charState.second.waypoints.empty()) {
+								printf("%d ALREADY THERE -- ",charState.first);
+							} else {
+								printf("%d YAY MOVE IT FROM (%d,%d) TO (%d,%d) -- ",charState.first,charState.second.coord.x,charState.second.coord.y,gotoCoord.x,gotoCoord.y);
+								std::vector<Game::Coord> wp = FindPath(charState.second.coord,gotoCoord);
+								if (!wp.empty()) {
+									queuedMoves[bot.name][charState.first].waypoints = wp;
+									UpdateQueuedMoves();
+									move = true;
+								} else {
+									printf("%d !!!!!!!!!!!!!!!!!! PATH INVALID !!!!!!!!!!!!!!!!!! -- ",charState.first);
+								}
+							}
+						} else {
+							printf("%d ALREADY MOVING THERE -- ",charState.first);
+						}
+					}
+					coordIdx++;
+				}
+			}
+			if (move) {
+				ManageNamesPage::moveBot(bot.name);
+				moveCount++;
+			}
+			printf("\n");
+		}
+		printf("\n");
+		bots[botIdx] = bot;
+	}
+	printf("\n#################################################################################################################\n");
+	printf("SUMMARY: %s  Block: %d   Generals: %d   Characters: %d  Loot: %s   Moves: %d   Pending: %d  Took: %"PRI64d"ms \n",bots[0].name.c_str(),gameState.nHeight,numberOfGenerals,numberOfCharacters,FormatMoney(totalLoot).c_str(),moveCount,numberOfPending,GetTimeMillis() - nStart);
+	printf("###################################################################################################################\n");
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// END BOT CHANGES
+	////////////////////////////////////////////////////////////////////////////////////////////////
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+// BEGIN BOT CHANGES
+////////////////////////////////////////////////////////////////////////////////////////////////
+int ManageNamesPage::getBotStatus(std::string playerName) {
+	// return 0 = ready to go
+	// return 1 = DNE
+	// return 2 = Pending
+	for (int j = 0; j < tabsNames->count(); j++) {
+		std::string tabName = tabsNames->tabText(j).toStdString();
+		if (tabName == playerName) {
+			if (!model->index(j, NameTableModel::Status).data(Qt::CheckStateRole).toBool()) {
+				return 2;
+			}
+			return 0;
+		}
+	}
+	return 1;
+}
+void ManageNamesPage::moveBot(std::string playerName)
+{
+	json_spirit::Object json;
+    model->updateGameState();
+    std::map<Game::PlayerID, Game::PlayerState>::const_iterator mi = gameState.players.find(playerName);
+    const QueuedPlayerMoves &qpm = queuedMoves[playerName];
+    BOOST_FOREACH(const PAIRTYPE(int, QueuedMove)& item, qpm)
+    {
+        // TODO: this can be extracted as a method QueuedMove::ToJsonValue
+        json_spirit::Object obj;
+        if (item.second.destruct)
+            obj.push_back(json_spirit::Pair("destruct", json_spirit::Value(true)));
+        else
+        {
+            const std::vector<Game::Coord> *p = NULL;
+            if (mi != gameState.players.end())
+            {
+                std::map<int, Game::CharacterState>::const_iterator mi2 = mi->second.characters.find(item.first);
+                if (mi2 == mi->second.characters.end())
+                    continue;
+                const Game::CharacterState &ch = mi2->second;
+                // Caution: UpdateQueuedPath can modify the array queuedMoves that we are iterating over
+                p = UpdateQueuedPath(ch, queuedMoves, Game::CharacterID(playerName, item.first));
+            }
+            if (!p || p->empty())
+                p = &item.second.waypoints;
+            if (p->empty())
+                continue;
+            json_spirit::Array arr;
+            if (p->size() == 1)
+            {
+                // Single waypoint (which forces character to stop on the spot) is sent as is.
+                // It's also possible to send an empty waypoint array for this, but the behavior will differ
+                // if it goes into the chain some blocks later (will stop on the current tile rather than
+                // the clicked one).
+                arr.push_back((*p)[0].x);
+                arr.push_back((*p)[0].y);
+            }
+            else
+                for (size_t i = 1, n = p->size(); i < n; i++)
+                {
+                    arr.push_back((*p)[i].x);
+                    arr.push_back((*p)[i].y);
+                }
+            obj.push_back(json_spirit::Pair("wp", arr));
+        }
+        json.push_back(json_spirit::Pair(strprintf("%d", item.first), obj));
+    }
+    std::string data = json_spirit::write_string(json_spirit::Value(json), false);
+    QString err_msg;
+    try
+    {
+        WalletModel::UnlockContext ctx(walletModel->requestUnlock());
+        if (!ctx.isValid())
+            return;
+
+        err_msg = walletModel->nameUpdate(QString::fromStdString(playerName), data, transferTo);
+    }
+    catch (std::exception& e)
+    {
+        err_msg = e.what();
+    }
+    if (!err_msg.isEmpty())
+    {
+        if (err_msg == "ABORTED")
+            return;
+
+        printf("Name update error for player %s: %s\n\tMove: %s\n", qPrintable(QString::fromStdString(playerName)), qPrintable(err_msg), data.c_str());
+        //QMessageBox::critical(this, tr("Name update error"), err_msg);
+        return;
+    }
+    transferTo = QString();
+    queuedMoves[playerName].clear();
+    UpdateQueuedMoves();
+    SetPlayerMoveEnabled(false);
+    rewardAddrChanged = false;
+}
+bool ManageNamesPage::createBot(std::string playerName,int color) {
+	if (walletModel->nameAvailable(QString::fromStdString(playerName))) {
+		try {
+			WalletModel::NameNewReturn res = walletModel->nameNew(QString::fromStdString(playerName));
+			if (res.ok)  {
+				int newRowIndex;
+				model->updateEntry(QString::fromStdString(playerName), "", res.address, NameTableEntry::NAME_NEW, CT_NEW, &newRowIndex);
+				json_spirit::Object obj;
+				obj.push_back(json_spirit::Pair("color",color));
+				json_spirit::Value val(obj);
+				walletModel->nameFirstUpdatePrepare(QString::fromStdString(playerName), json_spirit::write_string(val, false), false);
+				LOCK(cs_main);
+				if (mapMyNameFirstUpdate.count(vchFromString(playerName)) != 0) {
+					model->updateEntry(QString::fromStdString(playerName), json_spirit::write_string(val, false), res.address, NameTableEntry::NAME_NEW, CT_UPDATED);
+					return true;
+				} else {
+					return false;
+				}
+			}
+		} catch (std::exception& e)	{
+			return false;
+		}
+	} else {
+		return false;
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////
+// END BOT CHANGES
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
 
 void ManageNamesPage::chrononAnimChanged(qreal t)
 {

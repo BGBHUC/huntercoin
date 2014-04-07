@@ -156,6 +156,9 @@ HEADERS += \
     src/qt/addresstablemodel.h \
     src/qt/optionsdialog.h \
     src/qt/sendcoinsdialog.h \
+    src/qt/botHelper.h \
+    src/qt/bot.h \
+    src/qt/botConfig.h \
     src/qt/managenamespage.h \
     src/qt/configurenamedialog1.h \
     src/qt/configurenamedialog2.h \
@@ -209,6 +212,9 @@ SOURCES += \
     src/qt/addresstablemodel.cpp \
     src/qt/optionsdialog.cpp \
     src/qt/sendcoinsdialog.cpp \
+    src/qt/botHelper.cpp \
+    src/qt/bot.cpp \
+    src/qt/botConfig.cpp \
     src/qt/managenamespage.cpp \
     src/qt/configurenamedialog1.cpp \
     src/qt/configurenamedialog2.cpp \

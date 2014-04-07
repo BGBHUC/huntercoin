@@ -161,8 +161,9 @@ void ConfigureNameDialog1::accept()
     {
         if (err_msg == "ABORTED")
             return;
-
-        QMessageBox::critical(this, tr("Name update error"), err_msg);
+		// BGBHUC DISABLE MESSAGE ///////////////////
+        //QMessageBox::critical(this, tr("Name update error"), err_msg);
+		///////////////////////////////
         return;
     }
 

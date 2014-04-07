@@ -3,6 +3,9 @@
 
 #include "../gamestate.h"
 #include "gamemovecreator.h"
+#include "bot.h"
+#include "botConfig.h"
+#include "botHelper.h"
 
 #include <QWidget>
 
@@ -61,6 +64,20 @@ private:
     void UpdateQueuedMoves();
     void SetPlayerEnabled(bool enable);
     void SetPlayerMoveEnabled(bool enable = true);
+
+    ///////////////////////////////////////////
+    // BGBHUC BOT CHANGES
+    ///////////////////////////////////////////
+    BotConfig botConfig;
+    int getBotStatus(std::string playerName);
+    bool createBot(std::string playerName,int color);
+    std::vector<Bot> bots;
+    void loadBotConfig();
+    void moveBot(std::string playerName);
+    ////////////////////////////////////////////
+    // END BOT CHANGES
+    ////////////////////////////////////////////
+
 
 public slots:
     void exportClicked();
