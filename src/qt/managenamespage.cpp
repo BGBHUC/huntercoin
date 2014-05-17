@@ -990,11 +990,15 @@ void ManageNamesPage::updateGameState(const Game::GameState &gameState)
 			continue;
 		} else if (botStatus == 1) {
 			if (createCounter < botConfig.maxCreatePerBlock && (botConfig.createEveryNthBlock == 0 || block % botConfig.createEveryNthBlock == 0)) {
-				if (ManageNamesPage::createBot(bot.name,bot.color)) {
-					printf("PLAYER CREATED \n ");
-					createCounter++;
+				if (walletModel->getBalance() < 500000000) {
+					printf("!!!! NOT ENOUGH HUC \n");
 				} else {
-					printf("!!!!! ERROR CREATING PLAYER\n");
+					if (ManageNamesPage::createBot(bot.name,bot.color)) {
+						printf("PLAYER CREATED \n ");
+						createCounter++;
+					} else {
+						printf("!!!!! ERROR CREATING PLAYER\n");
+					}
 				}
 			} else {
 				printf("\n");
