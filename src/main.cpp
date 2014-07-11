@@ -399,7 +399,9 @@ bool CTransaction::CheckTransaction() const
     return hooks->CheckTransaction(*this);
 }
 
-bool CTransaction::AcceptToMemoryPool(CTxDB& txdb, bool fCheckInputs, bool fLimitFree, bool* pfMissingInputs)
+bool
+CTransaction::AcceptToMemoryPool (DatabaseSet& dbset, bool fCheckInputs,
+                                  bool fLimitFree, bool* pfMissingInputs)
 {
     if (pfMissingInputs)
         *pfMissingInputs = false;
@@ -436,7 +438,7 @@ bool CTransaction::AcceptToMemoryPool(CTxDB& txdb, bool fCheckInputs, bool fLimi
         if (mapTransactions.count(hash))
             return false;
     if (fCheckInputs)
-        if (txdb.ContainsTx(hash))
+        if (dbset.tx ().ContainsTx(hash))
             return false;
 
     // Check for conflicts with in-memory transactions
@@ -472,7 +474,8 @@ bool CTransaction::AcceptToMemoryPool(CTxDB& txdb, bool fCheckInputs, bool fLimi
         // Check against previous transactions
         map<uint256, CTxIndex> mapUnused;
         int64 nFees = 0;
-        if (!ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), pindexBest, nFees, false, false))
+        if (!ConnectInputs (dbset, mapUnused, CDiskTxPos(1,1,1), pindexBest,
+                            nFees, false, false))
         {
             if (pfMissingInputs)
                 *pfMissingInputs = true;
@@ -522,7 +525,7 @@ bool CTransaction::AcceptToMemoryPool(CTxDB& txdb, bool fCheckInputs, bool fLimi
         AddToMemoryPoolUnchecked();
     }
 
-    hooks->AcceptToMemoryPool(txdb, *this);
+    hooks->AcceptToMemoryPool (dbset, *this);
 
     ///// are we sure this is ok when loading transactions or restoring block txes
     // If updated, erase old tx from wallet
@@ -537,8 +540,9 @@ bool CTransaction::AcceptToMemoryPool(CTxDB& txdb, bool fCheckInputs, bool fLimi
 
 bool CTransaction::AcceptToMemoryPool(bool fCheckInputs, bool fLimitFree, bool* pfMissingInputs)
 {
-    CTxDB txdb("r");
-    return AcceptToMemoryPool(txdb, fCheckInputs, fLimitFree, pfMissingInputs);
+    DatabaseSet dbset("r");
+    return AcceptToMemoryPool (dbset, fCheckInputs, fLimitFree,
+                               pfMissingInputs);
 }
 
 bool CTransaction::AddToMemoryPoolUnchecked()
@@ -618,29 +622,31 @@ int CMerkleTx::GetBlocksToMaturity() const
 }
 
 
-bool CMerkleTx::AcceptToMemoryPool(CTxDB& txdb, bool fCheckInputs)
+bool
+CMerkleTx::AcceptToMemoryPool (DatabaseSet& dbset, bool fCheckInputs)
 {
     if (fClient)
     {
         if (!IsInMainChain() && !ClientConnectInputs())
             return false;
-        return CTransaction::AcceptToMemoryPool(txdb, false);
+        return CTransaction::AcceptToMemoryPool (dbset, false);
     }
     else
     {
-        return CTransaction::AcceptToMemoryPool(txdb, fCheckInputs);
+        return CTransaction::AcceptToMemoryPool (dbset, fCheckInputs);
     }
 }
 
 bool CMerkleTx::AcceptToMemoryPool()
 {
-    CTxDB txdb("r");
-    return AcceptToMemoryPool(txdb);
+    DatabaseSet dbset("r");
+    return AcceptToMemoryPool (dbset);
 }
 
 
 
-bool CWalletTx::AcceptWalletTransaction(CTxDB& txdb, bool fCheckInputs)
+bool
+CWalletTx::AcceptWalletTransaction (DatabaseSet& dbset, bool fCheckInputs)
 {
     CRITICAL_BLOCK(cs_mapTransactions)
     {
@@ -650,19 +656,30 @@ bool CWalletTx::AcceptWalletTransaction(CTxDB& txdb, bool fCheckInputs)
             if (!tx.IsCoinBase())
             {
                 uint256 hash = tx.GetHash();
-                if (!mapTransactions.count(hash) && !txdb.ContainsTx(hash))
-                    tx.AcceptToMemoryPool(txdb, fCheckInputs);
+                if (!mapTransactions.count (hash)
+                    && !dbset.tx ().ContainsTx (hash))
+                  tx.AcceptToMemoryPool (dbset, fCheckInputs);
             }
         }
-        return AcceptToMemoryPool(txdb, fCheckInputs);
+        return AcceptToMemoryPool (dbset, fCheckInputs);
     }
     return false;
 }
 
 bool CWalletTx::AcceptWalletTransaction() 
 {
-    CTxDB txdb("r");
-    return AcceptWalletTransaction(txdb);
+    DatabaseSet dbset("r");
+    return AcceptWalletTransaction (dbset);
+}
+
+unsigned char
+CTxIndex::GetSpentType (const CTransaction& tx)
+{
+  if (tx.IsGameTx ())
+    return SPENT_GAMETX;
+  if (tx.nVersion == NAMECOIN_TX_VERSION)
+    return SPENT_NAMETX;
+  return SPENT_TX;
 }
 
 int CTxIndex::GetDepthInMainChain() const
@@ -784,14 +801,9 @@ bool CBlock::ReadFromDisk(unsigned int nFile, unsigned int nBlockPos, bool fRead
     return true;
 }
 
-bool CBlock::ReadFromDisk(const CBlockIndex* pindex, bool fReadTransactions)
+bool CBlock::ReadFromDisk(const CBlockIndex* pindex)
 {
-    if (!fReadTransactions)
-    {
-        *this = pindex->GetBlockHeader();
-        return true;
-    }
-    if (!ReadFromDisk(pindex->nFile, pindex->nBlockPos, fReadTransactions))
+    if (!ReadFromDisk(pindex->nFile, pindex->nBlockPos, true))
         return false;
     if (GetHash() != pindex->GetBlockHash())
         return error("CBlock::ReadFromDisk() : GetHash() doesn't match index");
@@ -928,8 +940,8 @@ bool IsInitialBlockDownload()
         pindexLastBest = pindexBest;
         nLastUpdate = GetTime();
     }
-    return (GetTime() - nLastUpdate < 10 &&
-            pindexBest->GetBlockTime() < GetTime() - 24 * 60 * 60);
+    return (GetTime() - nLastUpdate < 60 &&
+            pindexBest->GetBlockTime() < GetTime() - 3600);
 }
 
 void static InvalidChainFound(CBlockIndex* pindexNew)
@@ -958,12 +970,13 @@ void static InvalidChainFound(CBlockIndex* pindexNew)
 
 
 
-bool CTransaction::DisconnectInputs(CTxDB& txdb, CBlockIndex* pindex)
+bool
+CTransaction::DisconnectInputs (DatabaseSet& dbset, CBlockIndex* pindex)
 {
-    if (!hooks->DisconnectInputs(txdb, *this, pindex))
+    if (!hooks->DisconnectInputs (dbset, *this, pindex))
         return false;
 
-    bool fGameTx = IsGameTx();
+    const bool fGameTx = IsGameTx ();
 
     // Relinquish previous transactions' spent pointers
     if (!IsCoinBase())
@@ -978,23 +991,23 @@ bool CTransaction::DisconnectInputs(CTxDB& txdb, CBlockIndex* pindex)
 
             // Get prev txindex from disk
             CTxIndex txindex;
-            if (!txdb.ReadTxIndex(prevout.hash, txindex))
+            if (!dbset.tx ().ReadTxIndex (prevout.hash, txindex))
                 return error("DisconnectInputs() : ReadTxIndex failed");
 
-            if (prevout.n >= txindex.vSpent.size())
+            if (prevout.n >= txindex.GetOutputCount ())
                 return error("DisconnectInputs() : prevout.n out of range");
 
             // Mark outpoint as not spent
-            txindex.vSpent[prevout.n].SetNull();
+            txindex.SetUnspent (prevout.n);
 
             // Write back
-            if (!txdb.UpdateTxIndex(prevout.hash, txindex))
+            if (!dbset.tx ().UpdateTxIndex (prevout.hash, txindex))
                 return error("DisconnectInputs() : UpdateTxIndex failed");
         }
     }
 
     // Remove transaction from index
-    if (!txdb.EraseTxIndex(*this))
+    if (!dbset.tx ().EraseTxIndex (*this))
         return error("DisconnectInputs() : EraseTxPos failed");
 
     return true;
@@ -1034,7 +1047,11 @@ bool CTransaction::FetchInputs(CTxDB& txdb, const map<uint256, CTxIndex>& mapTes
             fFound = txdb.ReadTxIndex(prevout.hash, txindex);
         }
         if (!fFound && (fBlock || fMiner))
-            return fMiner ? false : error("FetchInputs() : %s prev tx %s index entry not found", GetHash().ToString().substr(0,10).c_str(),  prevout.hash.ToString().substr(0,10).c_str());
+            return fMiner ? false
+                          : error ("FetchInputs() : %s prev tx %s"
+                                   " index entry not found",
+                                   GetHashForLog (),
+                                   prevout.hash.ToLogString ());
 
         // Read txPrev
         CTransaction& txPrev = inputsRet[prevout.hash].second;
@@ -1048,7 +1065,7 @@ bool CTransaction::FetchInputs(CTxDB& txdb, const map<uint256, CTxIndex>& mapTes
                     txPrev = mi->second;
             }
             if (!fFound)
-                txindex.vSpent.resize(txPrev.vout.size());
+              txindex.ResizeOutputs (txPrev.vout.size ());
         }
         else
         {
@@ -1067,20 +1084,23 @@ bool CTransaction::FetchInputs(CTxDB& txdb, const map<uint256, CTxIndex>& mapTes
         assert(inputsRet.count(prevout.hash) != 0);
         const CTxIndex& txindex = inputsRet[prevout.hash].first;
         const CTransaction& txPrev = inputsRet[prevout.hash].second;
-        if (prevout.n >= txPrev.vout.size() || prevout.n >= txindex.vSpent.size())
+        if (prevout.n >= txPrev.vout.size() || prevout.n >= txindex.GetOutputCount ())
         {
             // Revisit this if/when transaction replacement is implemented and allows
             // adding inputs:
             fInvalid = true;
-            return /*DoS(100,*/ error("FetchInputs() : %s prevout.n out of range %d %"PRIszu" %"PRIszu" prev tx %s\n%s", GetHash().ToString().substr(0,10).c_str(), prevout.n, txPrev.vout.size(), txindex.vSpent.size(), prevout.hash.ToString().substr(0,10).c_str(), txPrev.ToString().c_str()) /* ) */ ;
+            return /*DoS(100,*/ error("FetchInputs() : %s prevout.n out of range %d %"PRIszu" %"PRIszu" prev tx %s\n%s", GetHash().ToString().substr(0,10).c_str(), prevout.n, txPrev.vout.size(), txindex.GetOutputCount (), prevout.hash.ToString().substr(0,10).c_str(), txPrev.ToString().c_str()) /* ) */ ;
         }
     }
 
     return true;
 }
 
-bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx,
-                                 CBlockIndex* pindexBlock, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee)
+bool
+CTransaction::ConnectInputs (DatabaseSet& dbset,
+    map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx,
+    CBlockIndex* pindexBlock, int64& nFees,
+    bool fBlock, bool fMiner, int64 nMinFee)
 {
     // Take over previous transactions' spent pointers
     if (!IsCoinBase())
@@ -1092,107 +1112,145 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
         for (int i = 0; i < vin.size(); i++)
         {
             COutPoint prevout = vin[i].prevout;
-            CTransaction txPrev;
             CTxIndex txindex;
 
-            if (prevout.IsNull() && IsGameTx())
-            {
-                vTxPrev.push_back(txPrev);
-                vTxindex.push_back(txindex);
-                continue;
-            }
-
-            // Read txindex
+            /* Get the previous txindex if we have a prevout.  */
             bool fFound = true;
-            if (fMiner && mapTestPool.count(prevout.hash))
+            if (!prevout.IsNull ())
             {
-                // Get txindex from current proposed changes
-                txindex = mapTestPool[prevout.hash];
-            }
-            else
-            {
-                // Read txindex from txdb
-                fFound = txdb.ReadTxIndex(prevout.hash, txindex);
-            }
-            if (!fFound && (fBlock || fMiner))
-                return fMiner ? false : error("ConnectInputs() : %s prev tx %s index entry not found", GetHash().ToString().substr(0,10).c_str(),  prevout.hash.ToString().substr(0,10).c_str());
-
-            // Read txPrev
-            if (!fFound || txindex.pos == CDiskTxPos(1,1,1))
-            {
-                // Get prev tx from single transactions in memory
-                CRITICAL_BLOCK(cs_mapTransactions)
+                if (fMiner && mapTestPool.count(prevout.hash))
                 {
-                    if (!mapTransactions.count(prevout.hash))
-                        return error("ConnectInputs() : %s mapTransactions prev not found %s", GetHash().ToString().substr(0,10).c_str(),  prevout.hash.ToString().substr(0,10).c_str());
-                    txPrev = mapTransactions[prevout.hash];
+                    // Get txindex from current proposed changes
+                    txindex = mapTestPool[prevout.hash];
                 }
-                if (!fFound)
-                    txindex.vSpent.resize(txPrev.vout.size());
+                else
+                {
+                    // Read txindex from txdb
+                    fFound = dbset.tx ().ReadTxIndex (prevout.hash, txindex);
+                }
+                if (!fFound && (fBlock || fMiner))
+                    return fMiner ? false
+                                  : error ("ConnectInputs() : %s prev tx %s"
+                                           " index entry not found",
+                                           GetHashForLog (),
+                                           prevout.hash.ToLogString ());
+
+                /* If we have a txindex already, do some additional checks.
+                   For !fFound they make no sense as we would have
+                   unspent / "empty" vSpent anyway.  */
+                if (fFound)
+                {
+                    /* Check range of prevout.n.  */
+                    if (prevout.n >= txindex.GetOutputCount ())
+                        return error ("ConnectInputs() : %s prevout.n %d out of"
+                                      " range %d\n",
+                                      GetHashForLog (),
+                                      prevout.n, txindex.GetOutputCount ());
+
+                    /* Check for conflicts with double-spends.  */
+                    if (txindex.IsSpent (prevout.n))
+                        return fMiner ? false
+                                      : error ("ConnectInputs() : %s prev tx"
+                                               " already spent", GetHashForLog ());
+                }
             }
-            else
+
+            /* If this is a game transaction, we can bypass most of the
+               logic below.  But we have to potentially mark the outpoint
+               spent (if this is a player death).  */
+            if (!IsGameTx ())
             {
-                // Get prev tx from disk
-                if (!txPrev.ReadFromDisk(txindex.pos))
-                    return error("ConnectInputs() : %s ReadFromDisk prev tx %s failed", GetHash().ToString().substr(0,10).c_str(),  prevout.hash.ToString().substr(0,10).c_str());
+                if (prevout.IsNull ())
+                    return error ("ConnectInputs() : prevout is null for"
+                                  " non-game and non-coinbase transaction");
+
+                /* Read txPrev.  This is only used for non-game transactions,
+                   as game tx can be processed in ConnectInputsGameTx
+                   without previous transactions.  */
+                CTransaction txPrev;
+                if (!fFound || txindex.pos == CDiskTxPos(1,1,1))
+                {
+                    // Get prev tx from single transactions in memory
+                    CRITICAL_BLOCK(cs_mapTransactions)
+                    {
+                        if (!mapTransactions.count(prevout.hash))
+                            return error("ConnectInputs() : %s mapTransactions prev not found %s", GetHashForLog (), prevout.hash.ToLogString ());
+                        txPrev = mapTransactions[prevout.hash];
+                    }
+                }
+                else
+                {
+                    // Get prev tx from disk
+                    if (!txPrev.ReadFromDisk(txindex.pos))
+                        return error("ConnectInputs() : %s ReadFromDisk prev tx %s failed", GetHashForLog (),  prevout.hash.ToLogString ());
+                }
+
+                if (prevout.n >= txPrev.vout.size())
+                    return error ("ConnectInputs() : %s prevout.n %d out of"
+                                  " range %d prev tx %s\n%s",
+                                  GetHashForLog (),
+                                  prevout.n, txPrev.vout.size (),
+                                  prevout.hash.ToLogString (),
+                                  txPrev.ToString ().c_str ());
+
+                // If prev is coinbase, check that it's matured
+                if (txPrev.IsCoinBase())
+                {
+                    for (CBlockIndex* pindex = pindexBlock; pindex->pprev && pindexBlock->nHeight - pindex->nHeight < COINBASE_MATURITY; pindex = pindex->pprev)
+                        if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nBlockFile)
+                            return error("ConnectInputs() : tried to spend coinbase at depth %d", pindexBlock->nHeight - pindex->nHeight);
+                }
+                else if (txPrev.IsGameTx())
+                {
+                    for (CBlockIndex* pindex = pindexBlock; pindex->pprev && pindexBlock->nHeight - pindex->nHeight < GAME_REWARD_MATURITY; pindex = pindex->pprev)
+                        if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nBlockFile)
+                            return error("ConnectInputs() : tried to spend game reward at depth %d", pindexBlock->nHeight - pindex->nHeight);
+                }
+
+                // Verify signature
+                if (!VerifySignature(txPrev, *this, i))
+                    return error("ConnectInputs() : %s VerifySignature failed", GetHash().ToString().substr(0,10).c_str());
+
+                // Check for negative or overflow input values
+                nValueIn += txPrev.vout[prevout.n].nValue;
+                if (!MoneyRange(txPrev.vout[prevout.n].nValue) || !MoneyRange(nValueIn))
+                    return error("ConnectInputs() : txin values out of range");
+
+                /* Fill in vectors with previous transactions.  They are not
+                   used for game transactions and can thus stay empty
+                   for those.  */
+                vTxPrev.push_back (txPrev);
+                vTxindex.push_back (txindex);
             }
 
-            if (prevout.n >= txPrev.vout.size() || prevout.n >= txindex.vSpent.size())
-                return error("ConnectInputs() : %s prevout.n out of range %d %d %d prev tx %s\n%s", GetHash().ToString().substr(0,10).c_str(), prevout.n, txPrev.vout.size(), txindex.vSpent.size(), prevout.hash.ToString().substr(0,10).c_str(), txPrev.ToString().c_str());
-
-            // If prev is coinbase, check that it's matured
-            if (txPrev.IsCoinBase())
+            /* Mark previous outpoints as spent.  This is only necessary
+               when either fBlock or fMiner.  While the txindex is used
+               later also for vTxindex and the ConnectInputs hook,
+               vSpent is never actually used there.  */
+            if (!prevout.IsNull () && (fBlock || fMiner))
             {
-                for (CBlockIndex* pindex = pindexBlock; pindex->pprev && pindexBlock->nHeight - pindex->nHeight < COINBASE_MATURITY; pindex = pindex->pprev)
-                    if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nBlockFile)
-                        return error("ConnectInputs() : tried to spend coinbase at depth %d", pindexBlock->nHeight - pindex->nHeight);
+                assert (fFound);
+                txindex.SetSpent (prevout.n, *this);
+
+                if (fBlock)
+                {
+                    if (!dbset.tx ().UpdateTxIndex (prevout.hash, txindex))
+                        return error("ConnectInputs() : UpdateTxIndex failed");
+                }
+                else
+                {
+                    assert (fMiner);
+                    mapTestPool[prevout.hash] = txindex;
+                }
             }
-            else if (txPrev.IsGameTx())
-            {
-                for (CBlockIndex* pindex = pindexBlock; pindex->pprev && pindexBlock->nHeight - pindex->nHeight < GAME_REWARD_MATURITY; pindex = pindex->pprev)
-                    if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nBlockFile)
-                        return error("ConnectInputs() : tried to spend game reward at depth %d", pindexBlock->nHeight - pindex->nHeight);
-            }
-
-            // Verify signature
-            if (!VerifySignature(txPrev, *this, i))
-                return error("ConnectInputs() : %s VerifySignature failed", GetHash().ToString().substr(0,10).c_str());
-
-            // Check for conflicts
-            if (!txindex.vSpent[prevout.n].IsNull())
-                return fMiner ? false : error("ConnectInputs() : %s prev tx already used at %s", GetHash().ToString().substr(0,10).c_str(), txindex.vSpent[prevout.n].ToString().c_str());
-
-            // Check for negative or overflow input values
-            nValueIn += txPrev.vout[prevout.n].nValue;
-            if (!MoneyRange(txPrev.vout[prevout.n].nValue) || !MoneyRange(nValueIn))
-                return error("ConnectInputs() : txin values out of range");
-
-            // Mark outpoints as spent
-            txindex.vSpent[prevout.n] = posThisTx;
-
-            // Write back
-            if (fBlock)
-            {
-                if (!txdb.UpdateTxIndex(prevout.hash, txindex))
-                    return error("ConnectInputs() : UpdateTxIndex failed");
-            }
-            else if (fMiner)
-            {
-                mapTestPool[prevout.hash] = txindex;
-            }
-
-            vTxPrev.push_back(txPrev);
-            vTxindex.push_back(txindex);
         }
 
-        if (!hooks->ConnectInputs(txdb, mapTestPool, *this, vTxPrev, vTxindex, pindexBlock, posThisTx, fBlock, fMiner))
+        if (!hooks->ConnectInputs (dbset, mapTestPool, *this, vTxPrev, vTxindex,
+                                   pindexBlock, posThisTx, fBlock, fMiner))
             return false;
 
         if (!IsGameTx())
         {
-            if (nValueIn < GetValueOut())
-                return error("ConnectInputs() : %s value in < value out", GetHash().ToString().substr(0,10).c_str());
-
             // Tally transaction fees
             int64 nTxFee = nValueIn - GetValueOut();
             if (nTxFee < 0)
@@ -1208,7 +1266,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
     if (fBlock)
     {
         // Add transaction to disk index
-        if (!txdb.AddTxIndex(*this, posThisTx, pindexBlock->nHeight))
+        if (!dbset.tx ().AddTxIndex (*this, posThisTx, pindexBlock->nHeight))
             return error("ConnectInputs() : AddTxPos failed");
     }
     else if (fMiner)
@@ -1270,11 +1328,12 @@ bool CTransaction::ClientConnectInputs()
 
 
 
-bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
+bool
+CBlock::DisconnectBlock (DatabaseSet& dbset, CBlockIndex* pindex)
 {
     // Disconnect in reverse order
     for (int i = vgametx.size()-1; i >= 0; i--)
-        if (!vgametx[i].DisconnectInputs(txdb, pindex))
+        if (!vgametx[i].DisconnectInputs (dbset, pindex))
             return false;
 
     // FIXME: if in the same block a player made a move and died, the vgametx.DisconnectInputs call above
@@ -1282,10 +1341,10 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
     // The call to vtx.DisconnectInputs below will print a warning to debug.log then.
 
     for (int i = vtx.size()-1; i >= 0; i--)
-        if (!vtx[i].DisconnectInputs(txdb, pindex))
+        if (!vtx[i].DisconnectInputs (dbset, pindex))
             return false;
 
-    if (!hooks->DisconnectBlock(*this, txdb, pindex))
+    if (!hooks->DisconnectBlock (*this, dbset, pindex))
         return error("DisconnectBlock() : hook failed");
 
     // Update block index on disk without changing it in memory.
@@ -1294,14 +1353,15 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
     {
         CDiskBlockIndex blockindexPrev(pindex->pprev);
         blockindexPrev.hashNext = 0;
-        if (!txdb.WriteBlockIndex(blockindexPrev))
+        if (!dbset.tx ().WriteBlockIndex (blockindexPrev))
             return error("DisconnectBlock() : WriteBlockIndex failed");
     }
 
     return true;
 }
 
-bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
+bool
+CBlock::ConnectBlock (DatabaseSet& dbset, CBlockIndex* pindex)
 {
     // Check it again in case a previous version let a bad block in
     if (!CheckBlock(pindex->nHeight))
@@ -1317,14 +1377,15 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
         CDiskTxPos posThisTx(pindex->nFile, pindex->nBlockPos, nTxPos);
         nTxPos += ::GetSerializeSize(tx, SER_DISK);
 
-        if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex, nFees, true, false))
+        if (!tx.ConnectInputs (dbset, mapUnused, posThisTx, pindex,
+                               nFees, true, false))
             return false;
     }
 
     int64 nFeesBeforeTax = nFees;
 
     // This call updates the game state and creates vgametx
-    if (!hooks->ConnectBlock(*this, txdb, pindex, nFees, nTxPos))
+    if (!hooks->ConnectBlock(*this, dbset, pindex, nFees, nTxPos))
         return error("ConnectBlock() : hook failed");
 
     // nFees may include taxes from the game, so we check it after creating game transactions
@@ -1344,7 +1405,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
     {
         CDiskBlockIndex blockindexPrev(pindex->pprev);
         blockindexPrev.hashNext = pindex->GetBlockHash();
-        if (!txdb.WriteBlockIndex(blockindexPrev))
+        if (!dbset.tx ().WriteBlockIndex (blockindexPrev))
             return error("ConnectBlock() : WriteBlockIndex failed");
     }
 
@@ -1357,7 +1418,8 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
     return true;
 }
 
-bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
+static bool
+Reorganize (DatabaseSet& dbset, CBlockIndex* pindexNew)
 {
     printf("REORGANIZE\n");
 
@@ -1401,7 +1463,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
             CBlock block;
             if (!block.ReadFromDisk(pindex))
                 return error("Reorganize() : ReadFromDisk for disconnect failed");
-            if (!block.DisconnectBlock(txdb, pindex))
+            if (!block.DisconnectBlock (dbset, pindex))
                 return error("Reorganize() : DisconnectBlock failed");
 
             // Queue memory transactions to resurrect
@@ -1417,10 +1479,10 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
             CBlock block;
             if (!block.ReadFromDisk(pindex))
                 return error("Reorganize() : ReadFromDisk for connect failed");
-            if (!block.ConnectBlock(txdb, pindex))
+            if (!block.ConnectBlock (dbset, pindex))
             {
                 // Invalid block
-                txdb.TxnAbort();
+                dbset.TxnAbort ();
                 return error("Reorganize() : ConnectBlock failed");
             }
 
@@ -1428,11 +1490,11 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
             BOOST_FOREACH(const CTransaction& tx, block.vtx)
                 vDelete.push_back(tx);
         }
-        if (!txdb.WriteHashBestChain(pindexNew->GetBlockHash()))
+        if (!dbset.tx ().WriteHashBestChain (pindexNew->GetBlockHash ()))
             return error("Reorganize() : WriteHashBestChain failed");
 
         // Make sure it's successfully written to disk before changing memory structure
-        if (!txdb.TxnCommit())
+        if (!dbset.TxnCommit ())
             return error("Reorganize() : TxnCommit failed");
 
         // Disconnect shorter branch
@@ -1448,7 +1510,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 
     // Resurrect memory transactions that were in the disconnected branch
     BOOST_FOREACH(CTransaction& tx, vResurrect)
-        tx.AcceptToMemoryPool(txdb, false);
+        tx.AcceptToMemoryPool (dbset, false);
 
     // Delete redundant memory transactions that are in the connected branch
     BOOST_FOREACH(CTransaction& tx, vDelete)
@@ -1458,28 +1520,30 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 }
 
 
-bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
+bool
+CBlock::SetBestChain (DatabaseSet& dbset, CBlockIndex* pindexNew)
 {
     uint256 hash = GetHash();
 
-    txdb.TxnBegin();
+    dbset.TxnBegin ();
     if (pindexGenesisBlock == NULL && hash == hashGenesisBlock)
     {
-        txdb.WriteHashBestChain(hash);
-        if (!txdb.TxnCommit())
+        dbset.tx ().WriteHashBestChain (hash);
+        if (!dbset.TxnCommit ())
             return error("SetBestChain() : TxnCommit failed");
         pindexGenesisBlock = pindexNew;
     }
     else if (hashPrevBlock == hashBestChain)
     {
         // Adding to current best branch
-        if (!ConnectBlock(txdb, pindexNew) || !txdb.WriteHashBestChain(hash))
+        if (!ConnectBlock (dbset, pindexNew)
+            || !dbset.tx ().WriteHashBestChain (hash))
         {
-            txdb.TxnAbort();
+            dbset.TxnAbort ();
             InvalidChainFound(pindexNew);
             return error("SetBestChain() : ConnectBlock failed");
         }
-        if (!txdb.TxnCommit())
+        if (!dbset.TxnCommit ())
             return error("SetBestChain() : TxnCommit failed");
 
         // Add to current best branch
@@ -1492,9 +1556,9 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
     else
     {
         // New best branch
-        if (!Reorganize(txdb, pindexNew))
+        if (!Reorganize (dbset, pindexNew))
         {
-            txdb.TxnAbort();
+            dbset.TxnAbort ();
             InvalidChainFound(pindexNew);
             return error("SetBestChain() : Reorganize failed");
         }
@@ -1545,18 +1609,18 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
     }
     pindexNew->bnChainWork = (pindexNew->pprev ? pindexNew->pprev->bnChainWork : 0) + pindexNew->GetBlockWork();
 
-    CTxDB txdb;
-    txdb.TxnBegin();
-    txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
-    if (!txdb.TxnCommit())
+    {
+      DatabaseSet dbset;
+      dbset.TxnBegin ();
+      dbset.tx ().WriteBlockIndex (CDiskBlockIndex(pindexNew));
+      if (!dbset.TxnCommit ())
         return false;
 
-    // New best
-    if (pindexNew->bnChainWork > bnBestChainWork)
-        if (!SetBestChain(txdb, pindexNew))
-            return false;
-
-    txdb.Close();
+      // New best
+      if (pindexNew->bnChainWork > bnBestChainWork)
+        if (!SetBestChain (dbset, pindexNew))
+          return false;
+    }
 
     if (pindexNew == pindexBest)
     {
@@ -1686,6 +1750,16 @@ bool CBlock::CheckBlock(int nHeight) const
     BOOST_FOREACH(const CTransaction& tx, vtx)
         if (!tx.CheckTransaction())
             return error("CheckBlock() : CheckTransaction failed");
+
+    // Check for duplicate txids. This is caught by ConnectInputs(),
+    // but catching it earlier avoids a potential DoS attack:
+    set<uint256> uniqueTx;
+    BOOST_FOREACH(const CTransaction& tx, vtx)
+    {
+        uniqueTx.insert(tx.GetHash());
+    }
+    if (uniqueTx.size() != vtx.size())
+        return /*DoS(100,*/ error("CheckBlock() : duplicate transaction") /*)*/ ;
 
     // Check that it's not full of nonstandard transactions
     if (GetSigOpCount() > MAX_BLOCK_SIGOPS)
@@ -1974,25 +2048,50 @@ bool LoadBlockIndex(bool fAllowNew)
 
     hooks->MessageStart(pchMessageStart);
 
-    int nTxDbVersion = VERSION;
-
-    //
-    // Load block index
-    //
+    /* Load block index.  Update to the new format (without auxpow)
+       if necessary.  */
     {
+      int nTxDbVersion = VERSION;
+      {
         CTxDB txdb("cr");
+        txdb.ReadVersion (nTxDbVersion);
+        txdb.SetSerialisationVersion (nTxDbVersion);
+
         if (!txdb.LoadBlockIndex())
             return false;
-        txdb.ReadVersion(nTxDbVersion);
         txdb.Close();
-    }
+      }
 
-    if (nTxDbVersion < 1000400)
-    {
-        CTxDB txdb("r+");
-        printf("FixTxIndexBug...\n");
-        if (!txdb.FixTxIndexBug())
-            printf("FixTxIndexBug failed\n");
+      if (nTxDbVersion < 1000400)
+        {
+          CTxDB txdb("r+");
+          printf ("FixTxIndexBug...\n");
+          if (!txdb.FixTxIndexBug ())
+            printf ("FixTxIndexBug failed\n");
+        }
+
+      if (nTxDbVersion < 1001000)
+        {
+          CTxDB wtxdb;
+          /* SerialisationVersion is set to VERSION by default.  */
+
+          /* Go through each blkindex object loaded into memory and
+             write it again to disk.  */
+          printf ("Updating blkindex.dat data format...\n");
+          map<uint256, CBlockIndex*>::const_iterator mi;
+          for (mi = mapBlockIndex.begin (); mi != mapBlockIndex.end (); ++mi)
+            {
+              CDiskBlockIndex disk(mi->second);
+              wtxdb.WriteBlockIndex (disk);
+            }
+
+          /* Rewrite the txindex.  */
+          wtxdb.RewriteTxIndex (nTxDbVersion);
+
+          /* Rewrite the database to compact the storage format.  */
+          wtxdb.WriteVersion (VERSION);
+          wtxdb.Rewrite ();
+        }
     }
 
     //
@@ -2016,8 +2115,8 @@ bool LoadBlockIndex(bool fAllowNew)
         if (!block.AddToBlockIndex(nFile, nBlockPos))
             return error("LoadBlockIndex() : genesis block not accepted");
 
-        CTxDB txdb;
-        if (!block.ConnectBlock(txdb, pindexGenesisBlock))
+        DatabaseSet dbset;
+        if (!block.ConnectBlock (dbset, pindexGenesisBlock))
             return error("LoadBlockIndex() : genesis block not accepted");
     }
 
@@ -2562,7 +2661,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             }
             pfrom->PushInventory(CInv(MSG_BLOCK, pindex->GetBlockHash()));
             CBlock block;
-            block.ReadFromDisk(pindex, true);
+            block.ReadFromDisk(pindex);
             nBytes += block.GetSerializeSize(SER_NETWORK);
             if (--nLimit <= 0 || nBytes >= SendBufferSize()/2)
             {
@@ -2578,6 +2677,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
     else if (strCommand == "getheaders")
     {
+        /* 'getheaders' is never sent by the client code and thus also
+           not well tested.  Disable it for this reason until it is actually
+           used by some clients in production.  */
+        printf ("warning: ignored 'getheaders' message\n");
+#if 0
         CBlockLocator locator;
         uint256 hashStop;
         vRecv >> locator >> hashStop;
@@ -2610,6 +2714,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         }
 
         pfrom->PushMessage("headers", vHeaders);
+#endif
     }
 
 
@@ -3252,7 +3357,7 @@ CBlock* CreateNewBlock(CReserveKey& reservekey, int algo)
     CRITICAL_BLOCK(cs_main)
     CRITICAL_BLOCK(cs_mapTransactions)
     {
-        CTxDB txdb("r");
+        DatabaseSet dbset("r");
 
         // Priority order to process transactions
         list<COrphan> vOrphan; // list memory doesn't move
@@ -3271,7 +3376,7 @@ CBlock* CreateNewBlock(CReserveKey& reservekey, int algo)
                 // Read prev transaction
                 CTransaction txPrev;
                 CTxIndex txindex;
-                if (!txPrev.ReadFromDisk(txdb, txin.prevout, txindex))
+                if (!txPrev.ReadFromDisk (dbset.tx (), txin.prevout, txindex))
                 {
                     // Has to wait for dependencies
                     if (!porphan)
@@ -3315,7 +3420,7 @@ CBlock* CreateNewBlock(CReserveKey& reservekey, int algo)
         // If we do not exclude invalid game transactions, the block won't be accepted by ConnectBlock
         // Also we need to compute tax
         pindexPrev = pindexBest;
-        GameStepMiner gameStepMiner(txdb, pindexPrev);
+        GameStepMiner gameStepMiner(dbset, pindexPrev);
 
         // Collect transactions into block
         map<uint256, CTxIndex> mapTestPool;
@@ -3343,7 +3448,8 @@ CBlock* CreateNewBlock(CReserveKey& reservekey, int algo)
             // Connecting shouldn't fail due to dependency on other memory pool transactions
             // because we're already processing them in order of dependency
             map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
-            if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), pindexPrev, nFees, false, true, nMinFee))
+            if (!tx.ConnectInputs (dbset, mapTestPoolTmp, CDiskTxPos(1,1,1),
+                                   pindexPrev, nFees, false, true, nMinFee))
                 continue;
             if (!gameStepMiner.AddTx(tx))
                 continue;
@@ -3510,7 +3616,7 @@ bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
             return error("BitcoinMiner : ProcessBlock, block not accepted");
     }
 
-    Sleep(2000);
+    MilliSleep(2000);
     return true;
 }
 
@@ -3535,7 +3641,7 @@ void static BitcoinMiner(CWallet *pwallet)
 
         while (vNodes.empty() || IsInitialBlockDownload())
         {
-            Sleep(1000);
+            MilliSleep(1000);
             if (fShutdown)
                 return;
             if (!fGenerateBitcoins)
@@ -3678,7 +3784,7 @@ void static ScryptMiner(CWallet *pwallet)
 
         while (vNodes.empty() || IsInitialBlockDownload())
         {
-            Sleep(1000);
+            MilliSleep(1000);
             if (fShutdown)
                 return;
             if (!fGenerateBitcoins)
@@ -3858,7 +3964,7 @@ void GenerateBitcoins(bool fGenerate, CWallet* pwallet)
         {
             if (!CreateThread(ThreadBitcoinMiner, pwallet))
                 printf("Error: CreateThread(ThreadBitcoinMiner) failed\n");
-            Sleep(10);
+            MilliSleep(10);
         }
     }
 }
@@ -3961,15 +4067,32 @@ void MineGenesisBlock(CBlock *pblock, bool fUpdateBlockTime /* = true*/)
     }
 }
 
+int64
+CBlockIndex::GetTotalRewards () const
+{
+  /* Initialise with premine.  */
+  int64 total;
+  if (fTestNet)
+    total = 100 * COIN;
+  else
+    total = 85000 * COIN;
+
+  /* The genesis block had no ordinary mining reward, compensate for this.  */
+  total -= GetBlockValue (0, 0);
+
+  /* Sum up rewards (mining + harvest) over previous times.  */
+  for (int h = nHeight; h >= 0; --h)
+    total += GetBlockValue (h, 0) * 10;
+
+  return total;
+}
+
 std::string CBlockIndex::ToString() const
 {
-    return strprintf("CBlockIndex(nprev=%08x, pnext=%08x, nFile=%d, nBlockPos=%-6d nHeight=%d, merkle=%s, game-merkle=%s, hashBlock=%s, hashParentBlock=%s)",
+    return strprintf("CBlockIndex(nprev=%08x, pnext=%08x, nFile=%d, nBlockPos=%-6d nHeight=%d, merkle=%s, hashBlock=%s)",
             pprev, pnext, nFile, nBlockPos, nHeight,
             hashMerkleRoot.ToString().substr(0,10).c_str(),
-            hashGameMerkleRoot.ToString().substr(0,10).c_str(),
-            GetBlockHash().ToString().substr(0,20).c_str(),
-            (auxpow.get() != NULL) ? auxpow->GetParentBlockHash().ToString().substr(0,20).c_str() : "-"
-            );
+            GetBlockHash().ToString().substr(0,20).c_str());
 }
 
 CBigNum CBlockIndex::GetBlockWork() const

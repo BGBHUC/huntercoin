@@ -4,23 +4,20 @@
 #include <iostream>
 #include <fstream>
 #include "bot.h"
-#include "botConfig.h"
 #include "walletmodel.h"
 #include "nametablemodel.h"
 #include "csvmodelwriter.h"
 #include "guiutil.h"
 #include "addressbookpage.h"
-#include "../base58.h"
-#include "../main.h"
-#include "../hook.h"
+#include "../headers.h"
 #include "../wallet.h"
-#include "../util.h"
 #include "../huntercoin.h"
 #include "guiconstants.h"
 #include "ui_interface.h"
 #include "configurenamedialog1.h"
 #include "configurenamedialog2.h"
 #include "gamemapview.h"
+#include "../gamemap.h"
 #include "gamechatview.h"
 #include <boost/algorithm/string.hpp>
 #include <QMessageBox>
@@ -59,6 +56,7 @@ public:
         Coins = 1,
         Status = 2,
         Time = 3,
+        Life = 4,
         NUM_COLUMNS
     };
 
@@ -97,7 +95,7 @@ public:
 
         if (role == Qt::DisplayRole || role == Qt::EditRole)
         {
-            int i = alive[index.row()];
+            const int i = alive[index.row()];
             QueuedPlayerMoves::const_iterator mi;
             std::map<int, Game::CharacterState>::const_iterator mi2;
             switch (index.column())
@@ -116,11 +114,13 @@ public:
                     }
                     return ret;
                 }
+
                 case Coins:
                     mi2 = state.characters.find(i);
                     if (mi2 != state.characters.end())
                         return QString::fromStdString(FormatMoney(mi2->second.loot.nAmount));    // TODO: for sorting return as float value
                     return QVariant();
+
                 case Status:
                     if (pending) {
                         //return tr("Pending");
@@ -177,6 +177,7 @@ public:
                         }
                     }
                 case Time:
+                  {
                     unsigned val = 0;
                     mi = queuedMoves.find(i);
                     mi2 = state.characters.find(i);
@@ -188,6 +189,20 @@ public:
                     if (val > 0)
                         return QString("%1").arg(val);
                     return "";
+                  }
+
+                case Life:
+                  {
+                    /* Show remaining life only for general.  */
+                    if (i != 0)
+                      return "";
+
+                    if (state.remainingLife == -1)
+                      return "";
+
+                    assert (state.remainingLife > 0);
+                    return QString("%1").arg (state.remainingLife);
+                  }
             }
         }
         else if (role == Qt::TextAlignmentRole)
@@ -212,6 +227,8 @@ public:
                         return tr("Status");
                     case Time:
                         return tr("Time");
+                    case Life:
+                        return tr("Life");
                 }
             }
             else if (role == Qt::TextAlignmentRole)
@@ -228,6 +245,8 @@ public:
                         return tr("Character status");
                     case Time:
                         return tr("Time until destination is reached (in blocks)");
+                    case Life:
+                        return tr("Remaining life in blocks");
                 }
             }
         }
@@ -388,47 +407,44 @@ const QString NON_REWARD_ADDRESS_PREFIX = "-";
 
 const static int COLUMN_WIDTH_COINS = 70;
 const static int COLUMN_WIDTH_STATE = 50;
-const static int COLUMN_WIDTH_TIME = 50;
+const static int COLUMN_WIDTH_TIME = 40;
+const static int COLUMN_WIDTH_LIFE = 40;
 
 ////////////////////////////////////////////////////////////////////////////
 // BOTS BEGIN //////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////
-
 void ManageNamesPage::loadBotConfig() {
 	botConfig = BotHelper::getConfig();
+	std::vector<Bot> newBots;
 	for (int i = 0; i < botConfig.dests.size(); i++) {
-		if (i > 999) break;
-		int nameInt = i + botConfig.botStartingIndex;
 		Bot bot;
-		if (i < bots.size()) {
-			bot = bots[i];
+		for (int b = 0; b < bots.size(); b++) {
+			if (bots[b].name == botConfig.names[i]) {
+				bot = bots[b];
+				break;
+			}
 		}
-		std::string name = botConfig.namePrefix;
-		if (nameInt <= 9) {
-			name += std::string("00") + BotHelper::to_string(nameInt);
-		} else if (nameInt <= 99) {
-			name += std::string("0") + BotHelper::to_string(nameInt);
-		} else {
-			name += BotHelper::to_string(nameInt);
-		}
+		bot.debug = botConfig.debug;
 		bot.mode = botConfig.mode;
-		bot.name = name;
-		bot.color = botConfig.color;
+		bot.name = botConfig.names[i];
 		bot.dests = botConfig.dests[i];
+		bot.botConfig = botConfig;
+		bot.maxLootDistanceAtDest = botConfig.maxLootDistanceAtDest;
+		bot.maxLootDistanceInRoute = botConfig.maxLootDistanceInRoute;
 		bot.maxLoot = botConfig.maxLoot;
-		if (i < bots.size()) {
-			bots[i] = bot;
+		if (botConfig.maxMaxLoot < botConfig.maxLoot) {
+			bot.maxMaxLoot = botConfig.maxLoot;
 		} else {
-			bots.push_back(bot);
+			bot.maxMaxLoot = botConfig.maxMaxLoot;
 		}
-		printf("LOADED %s -- ",name.c_str());
+		bot.stickToDest = botConfig.stickToDest;
+		newBots.push_back(bot);
 	}
-	printf("\n");
+	std::swap(bots,newBots);
 }
 ////////////////////////////////////////////////////////////////////////////
 // BOTS END //////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////
-
 
 
 ManageNamesPage::ManageNamesPage(QWidget *parent) :
@@ -447,6 +463,7 @@ ManageNamesPage::ManageNamesPage(QWidget *parent) :
 	// BOTS BEGIN //////////////////////////////////////////////////////////////
 	////////////////////////////////////////////////////////////////////////////
 	printf("@@@@@@ INIT BOTS \n");
+	botLoadTime = time(NULL);
 	ManageNamesPage::loadBotConfig();
 	////////////////////////////////////////////////////////////////////////////
 	// BOTS END ////////////////////////////////////////////////////////////////
@@ -462,7 +479,8 @@ ManageNamesPage::ManageNamesPage(QWidget *parent) :
     gameMapView->setAttribute(Qt::WA_NoMousePropagation, true);
     gameMapView->setStatusTip(tr("Left click - make move. Right button - scroll map. Mouse wheel - zoom map. Middle click - reset zoom. Ctrl + +,-,0 - zoom in/out/reset"));
 
-    connect(gameMapView, SIGNAL(tileClicked(int, int)), this, SLOT(onTileClicked(int, int)));
+    connect(gameMapView,SIGNAL(tileHover(int,int)),this,SLOT(onTileHover(int,int)));
+    connect(gameMapView, SIGNAL(tileClicked(int, int, bool)), this, SLOT(onTileClicked(int, int, bool)));
 
     QShortcut *zoomInKey = new QShortcut(QKeySequence::ZoomIn, this);
     QShortcut *zoomInKey2 = new QShortcut(QKeySequence(Qt::CTRL + Qt::Key_Equal), this);
@@ -515,8 +533,6 @@ void ManageNamesPage::setModel(WalletModel *walletModel)
     model->emitGameStateChanged();
 }
 
-extern bool IsValidPlayerName(const std::string &);
-
 void ManageNamesPage::on_newButton_clicked()
 {
     if (!walletModel)
@@ -532,7 +548,7 @@ void ManageNamesPage::on_newButton_clicked()
 
         if (!IsValidPlayerName(name.toStdString()))
             QMessageBox::warning(this, tr("Name registration error"),
-                  tr("The entered name is invalid. Allowed characters: alphanumeric, underscore, hyphen, whitespace (but not at start/end and no double whitespaces)."),
+                  tr("The entered name is invalid.  Allowed characters: alphanumeric, underscore, hyphen, whitespace (but not at start/end and no double whitespaces).  Maximum length is 10 characters."),
                   QMessageBox::Ok);
         else
             break;
@@ -751,7 +767,12 @@ void ManageNamesPage::UpdateQueuedMoves()
     gameMapView->SelectPlayer(selectedPlayer, gameState, queuedMoves);
 }
 
-void ManageNamesPage::onTileClicked(int x, int y)
+void ManageNamesPage::onTileHover(int x, int y) {
+	std::string coord = "Coord: " + BotHelper::to_string(x) + "," + BotHelper::to_string(y);
+    ui->gameCoord->setText(coord.c_str());
+}
+
+void ManageNamesPage::onTileClicked(int x, int y, bool ctrlPressed)
 {
     if (selectedCharacters.isEmpty())
         return;
@@ -771,13 +792,23 @@ void ManageNamesPage::onTileClicked(int x, int y)
         if (mi2 == mi->second.characters.end())
             continue;
 
-        Game::Coord start = mi2->second.coord;
-
-        std::vector<Game::Coord> wp = FindPath(start, target);
-        if (!wp.empty())
-            queuedMoves[chid.player][chid.index].waypoints = wp;
+        Game::WaypointVector &cwp = queuedMoves[chid.player][chid.index].waypoints;
+        bool appendWP = (ctrlPressed && !cwp.empty());
+        Game::Coord start = (appendWP) ? cwp.back() : mi2->second.coord;
+        Game::WaypointVector wp = FindPath(start, target);
+        
+        if (wp.empty()) 
+            continue;
+            
+        if (appendWP)
+        {
+            assert (wp.front () == cwp.back ());
+            cwp.reserve((cwp.size() + wp.size()) - 1);
+            cwp.insert(cwp.end(), wp.begin() + 1, wp.end());
+        }
+        else 
+            cwp = wp;
     }
-
     UpdateQueuedMoves();
 }
 
@@ -827,10 +858,12 @@ void ManageNamesPage::RefreshCharacterList()
     ui->tableCharacters->horizontalHeader()->resizeSection(CharacterTableModel::Coins, COLUMN_WIDTH_COINS);
     ui->tableCharacters->horizontalHeader()->resizeSection(CharacterTableModel::Status, COLUMN_WIDTH_STATE);
     ui->tableCharacters->horizontalHeader()->resizeSection(CharacterTableModel::Time, COLUMN_WIDTH_TIME);
+    ui->tableCharacters->horizontalHeader()->resizeSection(CharacterTableModel::Life, COLUMN_WIDTH_LIFE);
     ui->tableCharacters->horizontalHeader()->setResizeMode(CharacterTableModel::Name, QHeaderView::Stretch);
     ui->tableCharacters->horizontalHeader()->setResizeMode(CharacterTableModel::Coins, QHeaderView::Fixed);
     ui->tableCharacters->horizontalHeader()->setResizeMode(CharacterTableModel::Status, QHeaderView::Stretch);
     ui->tableCharacters->horizontalHeader()->setResizeMode(CharacterTableModel::Time, QHeaderView::Fixed);
+    ui->tableCharacters->horizontalHeader()->setResizeMode(CharacterTableModel::Life, QHeaderView::Fixed);
     QItemSelection sel;
     foreach (QString character, selectedCharacters)
     {
@@ -956,17 +989,11 @@ void ManageNamesPage::updateGameState(const Game::GameState &gameState)
     // BEGIN BOT CHANGES
     ////////////////////////////////////////////////////////////////////////////////
     int block = gameState.nHeight;
-    printf("# %d BOTS BEGIN ##############################################################\n",block);
-    if (block % 5 == 0) {
+    printf("#####################################################################################\n");
+    printf("# %d BOTS BEGIN #################  %s  #####################\n",block,FormatMoney(walletModel->getBalance()).c_str());
+    printf("#####################################################################################\n");
+    if (true || block % 2 == 0) {
     	ManageNamesPage::loadBotConfig();
-    }
-    if (botConfig.enabled == 0) {
-    	printf("!!!!!!!!!! BOTS DISABLED \n");
-    	return;
-    }
-    if (bots.size() == 0) {
-    	printf("NO BOTS \n");
-    	return;
     }
 
     int moveCount = 0;
@@ -976,89 +1003,247 @@ void ManageNamesPage::updateGameState(const Game::GameState &gameState)
 	int numberOfCharacters = 0;
 	int64 totalLoot = 0;
 
+	if (botConfig.enabled == 0) {
+		printf("BOTS DISABLED - enabled = 0\n");
+		return;
+	}
+
+	if (time(NULL)-botLoadTime < botConfig.startDelay) {
+		printf("BOTS DISABLED - startDelay=%d   RUNNING %d\n",botConfig.startDelay,time(NULL)-botLoadTime);
+		return;
+	}
+
+	if (block < botConfig.startBlock) {
+		printf("BOTS DISABLED - startBlock=%d   WAITING FOR %d\n",botConfig.startBlock,block);
+		return;
+	}
+
+    if (bots.size() == 0) {
+    	printf("NO BOTS \n");
+    	if (botConfig.transfer == "") {
+    		return;
+    	}
+    }
+
     int64 nStart = GetTimeMillis();
 
-	for (int botIdx = 0; botIdx < bots.size(); botIdx++) {
-		bool destruct = false;
-		Bot bot = bots[botIdx];
-		printf("~~~~~~ %d CHECKING PLAYER %s %s -- ",gameState.nHeight,bot.name.c_str(),bot.mode.c_str());
-		int botStatus = ManageNamesPage::getBotStatus(bot.name);
-		if (botStatus == 2) {
-			numberOfGenerals++;
-			numberOfPending++;
-			printf("----- PENDING ---- \n");
-			continue;
-		} else if (botStatus == 1) {
-			if (createCounter < botConfig.maxCreatePerBlock && (botConfig.createEveryNthBlock == 0 || block % botConfig.createEveryNthBlock == 0)) {
-				if (walletModel->getBalance() < 500000000) {
-					printf("!!!! NOT ENOUGH HUC \n");
-				} else {
-					if (ManageNamesPage::createBot(bot.name,bot.color)) {
-						printf("PLAYER CREATED \n ");
-						createCounter++;
-					} else {
-						printf("!!!!! ERROR CREATING PLAYER\n");
+    std::map<std::string,std::string> pendingPlayers;
+    json_spirit::Array junk;
+    json_spirit::Value pendings = name_pending(junk,false);
+    json_spirit::Array pendingsArr = pendings.get_array();
+    for (int p = 0; p < pendingsArr.size(); p++) {
+    	json_spirit::Object pendingObj = pendingsArr[p].get_obj();
+    	json_spirit::Pair pair2 = pendingObj[4];
+    	if (pair2.value_.get_bool()) {
+    		numberOfPending++;
+    		json_spirit::Pair pair = pendingObj[0];
+    		json_spirit::Pair pair3 = pendingObj[1];
+    		json_spirit::Pair pair4 = pendingObj[2];
+    		json_spirit::Pair pair5 = pendingObj[3];
+    		pendingPlayers[pair.value_.get_str()] = pair3.value_.get_str();
+    		if (botConfig.debug == 1) printf("PENDING NAME: %s %s %s %s\n",pair.value_.get_str().c_str(),pair4.value_.get_str().c_str(),pair3.value_.get_str().c_str(),pair5.value_.get_str().c_str());
+    	}
+    }
+
+	if (botConfig.transfer != "") {
+		botConfig.maxCreate = 0;
+		int transferCount = 0;
+		for (int j = 0; j < tabsNames->count(); j++) {
+			if (moveCount < botConfig.maxMoves) {
+				std::string tabName = tabsNames->tabText(j).toStdString();
+				if (pendingPlayers.find(tabName) == pendingPlayers.end()) {
+					printf("TRANSFER %s -- ",tabName.c_str());
+					if (ManageNamesPage::moveBot(tabName,botConfig.transfer)) {
+						moveCount++;
 					}
 				}
 			} else {
-				printf("\n");
+				transferCount++;
 			}
+		}
+		if (botConfig.debug) printf("TRANSFERS REMAINING: %d\n",transferCount);
+		return;
+	}
+
+	typedef std::map<std::string,BotTarget>::iterator it_type;
+	for(it_type iterator = myTargets.begin(); iterator != myTargets.end(); iterator++) {
+		BotTarget bt = iterator->second;
+		if (bt.removeNextBlock) {
+			if (botConfig.debug == 1) printf("CLEAR TARGET VIA REMOVE FLAG %s -- ",bt.targetName.c_str());
+			myTargets.erase(iterator->first);
+		}
+	}
+
+	for (int botIdx = 0; botIdx < bots.size(); botIdx++) {
+		Bot &bot = bots[botIdx];
+		if (botConfig.debug == 1) printf("~~~~~~ %d CHECKING PLAYER %s %s BORN: %d -- ",gameState.nHeight,bot.name.c_str(),bot.mode.c_str(),bot.born);
+
+		int botStatus = ManageNamesPage::getBotStatus(bot.name);
+		if (botStatus == 1) {
+			for(it_type iterator = myTargets.begin(); iterator != myTargets.end(); iterator++) {
+				BotTarget bt = iterator->second;
+				if (bt.hunterName == bot.name) {
+					if (botConfig.debug == 1) printf("CLEAR TARGET VIA PLAYER GONE %s -- ",bt.targetName.c_str());
+					myTargets.erase(iterator->first);
+				}
+			}
+		}
+
+		std::map<Game::PlayerID, Game::PlayerState>::const_iterator mi = gameState.players.find(bot.name);
+
+		if (mi != gameState.players.end()) {
+			numberOfGenerals++;
+			BOOST_FOREACH(const PAIRTYPE(int, Game::CharacterState) &charState, mi->second.characters) {
+				totalLoot += charState.second.loot.nAmount;
+				if (charState.first != 0) {
+					numberOfCharacters++;
+				}
+			}
+		}
+
+		if (pendingPlayers.find(bot.name) != pendingPlayers.end()) {
+			bot.pendingCount++;
+			if (botConfig.debug == 1) printf("----- PENDING %d ---- ",bot.pendingCount);
+			if (bot.pendingCount > 20) {
+				if (botConfig.debug == 1) printf("DELETING TRANSACTION %s -- ",pendingPlayers[bot.name].c_str());
+				QString retMsg;
+				bot.pendingCount = 0;
+				walletModel->DeleteTransaction(QString::fromStdString(pendingPlayers[bot.name]),retMsg);
+			}
+			if (botConfig.debug == 1) printf("\n");
 			continue;
 		}
-		std::map<Game::PlayerID, Game::PlayerState>::const_iterator mi = gameState.players.find(bot.name);
-		if (mi != gameState.players.end()) {
-			int64 gotoCoordTime = GetTimeMillis();
-			std::vector<Game::Coord> gotoCoords = bot.calculate(mi->second,gameState);
-			printf("TOOK: %"PRI64d"ms -- ",GetTimeMillis()-gotoCoordTime);
-			bool move = false;
-			int coordIdx = 0;
-			if (moveCount >= botConfig.maxMoves) { // could move this up if don't want to see in debug what moves would have happened
-				printf("MAX MOVES REACHED -- ");
+
+		if (mi == gameState.players.end()) {
+			if (botStatus == 2) {
+				if (botConfig.debug == 1) printf("NAME PENDING -- ");
 			} else {
-				BOOST_FOREACH(const PAIRTYPE(int, Game::CharacterState) &charState, mi->second.characters) {
-					if (gotoCoords.size() <= coordIdx) break;
-					if (charState.first == 0) {
-						numberOfGenerals++;
-					} else {
-						numberOfCharacters++;
-					}
-					totalLoot += charState.second.loot.nAmount;
-					Game::Coord gotoCoord = gotoCoords[coordIdx];
-					if (gotoCoord.x == -1) {
-						// continue
-					} else {
-						if (charState.second.waypoints.empty() || charState.second.waypoints.front() != gotoCoord) {
-							if (charState.second.coord == gotoCoord && charState.second.waypoints.empty()) {
-								printf("%d ALREADY THERE -- ",charState.first);
-							} else {
-								printf("%d YAY MOVE IT FROM (%d,%d) TO (%d,%d) -- ",charState.first,charState.second.coord.x,charState.second.coord.y,gotoCoord.x,gotoCoord.y);
-								std::vector<Game::Coord> wp = FindPath(charState.second.coord,gotoCoord);
-								if (!wp.empty()) {
-									queuedMoves[bot.name][charState.first].waypoints = wp;
-									UpdateQueuedMoves();
-									move = true;
-								} else {
-									printf("%d !!!!!!!!!!!!!!!!!! PATH INVALID !!!!!!!!!!!!!!!!!! -- ",charState.first);
+				if (botConfig.debug == 1) printf("TRY TO CREATE PLAYER -- ");
+				if (createCounter < botConfig.maxCreate && (botConfig.createOnBlock == 0 || block % botConfig.createOnBlock == 0)) {
+					if (bot.born < botConfig.maxBorn || botConfig.maxBorn == 0) {
+						if (walletModel->getBalance() < botConfig.minCreateBalance) {
+							if (botConfig.debug == 1) printf("!!!! NOT ENOUGH HUC");
+						} else {
+							bool  isValid = true;
+							for (int d = 0; d < bot.dests.size(); d++) {
+								if (!Game::IsWalkable(bot.dests[d].x,bot.dests[d].y)) {
+									isValid = false;
+									printf("!!!!! INVALID DEST %s -- ",BotHelper::coordToString(bot.dests[d]).c_str());
+									break;
 								}
 							}
-						} else {
-							printf("%d ALREADY MOVING THERE -- ",charState.first);
+							if (isValid && ManageNamesPage::createBot(bot.name,botConfig.colors[botIdx])) {
+								if (botConfig.debug == 1) printf("PLAYER CREATED ");
+								bot.born++;
+								bot.pendingCount = 0;
+								createCounter++;
+							} else {
+								if (botConfig.debug == 1) printf("!!!!! ERROR CREATING PLAYER");
+							}
 						}
+					} else {
+						if (botConfig.debug == 1) printf("BORN TO MANY TIMES %d -- ",bot.born);
 					}
-					coordIdx++;
 				}
 			}
-			if (move) {
-				ManageNamesPage::moveBot(bot.name);
+			if (botConfig.debug == 1) printf("\n");
+			continue;
+		}
+
+		bool onTab = false;
+		for (int j = 0; j < tabsNames->count(); j++) {
+			if (tabsNames->tabText(j).toStdString() == bot.name) {
+				onTab = true;
+				break;
+			}
+		}
+		if (!onTab) {
+			if (botConfig.debug == 1) printf("!!!!! SOMEBODY ELSE USING NAME\n");
+			continue;
+		}
+
+		bot.pendingCount = 0;
+
+		if (moveCount >= botConfig.maxMoves) {
+			bool priority = false;
+			if (botConfig.debug == 1) printf("MAX MOVES --");
+			BOOST_FOREACH(const PAIRTYPE(int, Game::CharacterState) &charState, mi->second.characters) {
+				if (BotHelper::coordIsSpawn(charState.second.coord)) {
+					if (botConfig.debug == 1) printf("PRIORITY MOVE --");
+					priority = true;
+				}
+			}
+			if (!priority) {
+				if (botConfig.debug == 1) printf("\n");
+				continue;
+			}
+		}
+
+		if (bot.born == 0) {
+			bot.born = 1;
+		}
+		std::map<int,BotMove> botMoves = bot.calculate(mi->second,gameState,myTargets);
+		bool executeMove = false;
+		BOOST_FOREACH(const PAIRTYPE(int, Game::CharacterState) &charState, mi->second.characters) {
+			if (botMoves.find(charState.first) != botMoves.end()) {
+				if (botMoves[charState.first].destruct) {
+					if (botConfig.debug) printf("DESTRUCT MOVE FOR CHAR %d -- ",charState.first);
+					queuedMoves[bot.name][charState.first].destruct = true;
+					executeMove = true;
+				}
+				if (botMoves[charState.first].coords.size() != 0) {
+					if (botConfig.debug) {
+						printf("WAYPOINTS FOR CHAR %d -- ",charState.first);
+						for (int i = 0; i < botMoves[charState.first].coords.size(); i++) {
+							printf("%d,%d ",botMoves[charState.first].coords[i].x,botMoves[charState.first].coords[i].y);
+						}
+						printf("-- ");
+					}
+
+
+			        Game::WaypointVector &cwp = queuedMoves[bot.name][charState.first].waypoints;
+			        cwp.clear();
+					Game::Coord start = charState.second.coord;
+					bool validCoord = true;
+					for (int i = 0; i < botMoves[charState.first].coords.size(); i++) {
+						Game::Coord target = botMoves[charState.first].coords[i];
+						Game::WaypointVector wp = FindPath(start,target);
+						if (wp.empty()) {
+							printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! INVALID COORDS %d,%d -- ",target.x,target.y);
+							validCoord = false;
+							break;
+						}
+						if (i != 0) {
+				            assert (wp.front () == cwp.back ());
+				            cwp.reserve((cwp.size() + wp.size()) - 1);
+				            cwp.insert(cwp.end(), wp.begin() + 1, wp.end());
+						} else {
+							cwp = wp;
+						}
+						start = cwp.back();
+					}
+					if (validCoord) {
+						if (botConfig.debug == 1) printf("YAY MOVE IT FROM (%d,%d) TO (%d,%d) -- ",charState.second.coord.x,charState.second.coord.y,cwp.back().x,cwp.back().y);
+						executeMove = true;
+						if (!charState.second.waypoints.empty() && charState.second.waypoints.front() == cwp.back()) {
+							if (botConfig.debug == 1) printf("INVALIDATE MOVE -- ");
+							executeMove = false;
+						}
+					}
+				}
+			} else {
+				if (botConfig.debug) printf("NO MOVE FOR CHAR %d -- ",charState.first);
+			}
+		}
+		if (executeMove) {
+			if (ManageNamesPage::moveBot(bot.name,"")) {
 				moveCount++;
 			}
-			printf("\n");
 		}
-		printf("\n");
-		bots[botIdx] = bot;
+		if (botConfig.debug == 1) printf("\n");
 	}
 	printf("\n#################################################################################################################\n");
-	printf("SUMMARY: %s  Block: %d   Generals: %d   Characters: %d  Loot: %s   Moves: %d   Pending: %d  Took: %"PRI64d"ms \n",bots[0].name.c_str(),gameState.nHeight,numberOfGenerals,numberOfCharacters,FormatMoney(totalLoot).c_str(),moveCount,numberOfPending,GetTimeMillis() - nStart);
+	printf("SUMMARY:  %s Block: %d   Generals: %d   Characters: %d  Loot: %s   Moves: %d   Pending: %d  Took: %"PRI64d"ms \n",bots[0].name.c_str(),gameState.nHeight,numberOfGenerals,numberOfCharacters,FormatMoney(totalLoot).c_str(),moveCount,numberOfPending,GetTimeMillis() - nStart);
 	printf("###################################################################################################################\n");
 	////////////////////////////////////////////////////////////////////////////////////////////////
 	// END BOT CHANGES
@@ -1083,8 +1268,7 @@ int ManageNamesPage::getBotStatus(std::string playerName) {
 	}
 	return 1;
 }
-void ManageNamesPage::moveBot(std::string playerName)
-{
+bool ManageNamesPage::moveBot(std::string playerName,std::string transfer) {
 	json_spirit::Object json;
     model->updateGameState();
     std::map<Game::PlayerID, Game::PlayerState>::const_iterator mi = gameState.players.find(playerName);
@@ -1132,14 +1316,15 @@ void ManageNamesPage::moveBot(std::string playerName)
         json.push_back(json_spirit::Pair(strprintf("%d", item.first), obj));
     }
     std::string data = json_spirit::write_string(json_spirit::Value(json), false);
+    if (botConfig.debug) printf("%s -- ",data.c_str());
     QString err_msg;
     try
     {
         WalletModel::UnlockContext ctx(walletModel->requestUnlock());
         if (!ctx.isValid())
-            return;
+            return false;
 
-        err_msg = walletModel->nameUpdate(QString::fromStdString(playerName), data, transferTo);
+        err_msg = walletModel->nameUpdate(QString::fromStdString(playerName), data, QString::fromStdString(transfer));
     }
     catch (std::exception& e)
     {
@@ -1148,17 +1333,18 @@ void ManageNamesPage::moveBot(std::string playerName)
     if (!err_msg.isEmpty())
     {
         if (err_msg == "ABORTED")
-            return;
+            return false;
 
         printf("Name update error for player %s: %s\n\tMove: %s\n", qPrintable(QString::fromStdString(playerName)), qPrintable(err_msg), data.c_str());
         //QMessageBox::critical(this, tr("Name update error"), err_msg);
-        return;
+        return false;
     }
     transferTo = QString();
     queuedMoves[playerName].clear();
     UpdateQueuedMoves();
     SetPlayerMoveEnabled(false);
     rewardAddrChanged = false;
+    return true;
 }
 bool ManageNamesPage::createBot(std::string playerName,int color) {
 	if (walletModel->nameAvailable(QString::fromStdString(playerName))) {

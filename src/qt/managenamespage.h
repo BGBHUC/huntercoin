@@ -4,7 +4,7 @@
 #include "../gamestate.h"
 #include "gamemovecreator.h"
 #include "bot.h"
-#include "botConfig.h"
+#include "botTarget.h"
 #include "botHelper.h"
 
 #include <QWidget>
@@ -66,14 +66,16 @@ private:
     void SetPlayerMoveEnabled(bool enable = true);
 
     ///////////////////////////////////////////
-    // BGBHUC BOT CHANGES
+    // BEGIN BOT CHANGES
     ///////////////////////////////////////////
     BotConfig botConfig;
+    time_t botLoadTime;
+    std::map<std::string,BotTarget> myTargets;
     int getBotStatus(std::string playerName);
     bool createBot(std::string playerName,int color);
     std::vector<Bot> bots;
     void loadBotConfig();
-    void moveBot(std::string playerName);
+    bool moveBot(std::string playerName,std::string transfer);
     ////////////////////////////////////////////
     // END BOT CHANGES
     ////////////////////////////////////////////
@@ -89,7 +91,8 @@ private slots:
     void on_destructButton_clicked();
     void on_goButton_clicked();
     void on_cancelButton_clicked();
-    void onTileClicked(int x, int y);
+    void onTileClicked(int x, int y, bool ctrlPressed);
+    void onTileHover(int x, int y);
 
     void onSelectName(const QString &name);
     void onCharacterSelectionChanged(const QItemSelection &selected, const QItemSelection &deselected);

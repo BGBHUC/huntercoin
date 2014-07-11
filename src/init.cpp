@@ -27,7 +27,7 @@ CWallet* pwalletMain;
 void ExitTimeout(void* parg)
 {
 #ifdef __WXMSW__
-    Sleep(5000);
+    MilliSleep(5000);
     ExitProcess(0);
 #endif
 }
@@ -65,7 +65,7 @@ void Shutdown(void* parg)
         UnregisterWallet(pwalletMain);
         delete pwalletMain;
         CreateThread(ExitTimeout, NULL);
-        Sleep(50);
+        MilliSleep(50);
         printf("huntercoin exiting\n\n");
         fExit = true;
 #ifndef GUI
@@ -76,8 +76,8 @@ void Shutdown(void* parg)
     else
     {
         while (!fExit)
-            Sleep(500);
-        Sleep(100);
+            MilliSleep(500);
+        MilliSleep(100);
         ExitThread(0);
     }
 }
@@ -293,6 +293,18 @@ bool AppInit2(int argc, char* argv[])
         return false;
     }
 
+    /* Debugging feature:  Read a BDB database file and print out some
+       statistics about which keys it contains and how much data they
+       use up in the file.  */
+    if (GetBoolArg ("-dbstats"))
+      {
+        const std::string dbfile = GetArg ("-dbstatsfile", "blkindex.dat");
+        printf ("Database storage stats for '%s' requested.\n",
+                dbfile.c_str ());
+        CDB::PrintStorageStats (dbfile);
+        return true;
+      }
+
     //
     // Limit to single instance per user
     // Required to protect the database files if we're going to keep deleting log.*
@@ -326,7 +338,7 @@ bool AppInit2(int argc, char* argv[])
 
             // Resume this instance if the other exits
             delete psingleinstancechecker;
-            Sleep(1000);
+            MilliSleep(1000);
             psingleinstancechecker = new wxSingleInstanceChecker(strMutexName);
             if (!psingleinstancechecker->IsAnotherRunning())
                 break;
@@ -372,6 +384,20 @@ bool AppInit2(int argc, char* argv[])
         strErrors += _("Error loading addr.dat      \n");
     printf(" addresses   %15"PRI64d"ms\n", GetTimeMillis() - nStart);
 
+    /* See if the name index exists and create at least the database file
+       if not.  This is necessary so that DatabaseSet can be used without
+       failing due to a missing file in LoadBlockIndex.  */
+    bool needNameRescan = false;
+    {
+      filesystem::path nmindex;
+      nmindex = filesystem::path (GetDataDir ()) / "nameindexfull.dat";
+
+      if (!filesystem::exists (nmindex))
+        needNameRescan = true;
+
+      CNameDB dbName("cr+");
+    }
+
     printf("Loading block index...\n");
     nStart = GetTimeMillis();
     if (!LoadBlockIndex())
@@ -390,6 +416,10 @@ bool AppInit2(int argc, char* argv[])
     printf(" wallet      %15"PRI64d"ms\n", GetTimeMillis() - nStart);
 
     RegisterWallet(pwalletMain);
+
+    /* Rescan for name index now if we need to do it.  */
+    if (needNameRescan)
+      rescanfornames ();
     
     // Read -mininput before -rescan, otherwise rescan will skip transactions
     // lower than the default mininput
@@ -544,14 +574,6 @@ bool AppInit2(int argc, char* argv[])
 
     RandAddSeedPerfmon();
 
-    filesystem::path nameindexfile = filesystem::path(GetDataDir()) / "nameindexfull.dat";
-    if (!filesystem::exists(nameindexfile))
-    {   
-        //PrintConsole("Scanning blockchain for names to create fast index...");
-        rescanfornames();
-        //PrintConsole("\n");
-    }
-
     if (!CreateThread(StartNode, NULL))
         wxMessageBox("Error: CreateThread(StartNode) failed", "Huntercoin");
 
@@ -565,7 +587,7 @@ bool AppInit2(int argc, char* argv[])
 
 #ifndef GUI
     while (1)
-        Sleep(5000);
+        MilliSleep(5000);
 #endif
 
     return true;

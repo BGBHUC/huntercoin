@@ -356,6 +356,41 @@ Value TxToValue(const CTransaction &tx)
     return txobj;
 }
 
+static double
+GetDifficultyFromBits (unsigned int nBits)
+{
+    // Floating point number that is a multiple of the minimum difficulty,
+    // minimum difficulty = 1.0.
+
+    int nShift = (nBits >> 24) & 0xff;
+
+    double dDiff =
+        (double)0x0000ffff / (double)(nBits & 0x00ffffff);
+
+    while (nShift < 29)
+    {
+        dDiff *= 256.0;
+        nShift++;
+    }
+    while (nShift > 29)
+    {
+        dDiff /= 256.0;
+        nShift--;
+    }
+
+    return dDiff;
+}
+
+static double
+GetDifficulty (int algo)
+{
+  const CBlockIndex* blockindex = GetLastBlockIndexForAlgo (pindexBest, algo);
+  if (blockindex == NULL)
+    return GetDifficultyFromBits (bnInitialHashTarget[algo].GetCompact ());
+
+  return GetDifficultyFromBits (blockindex->nBits);
+}
+
 Value BlockToValue(CBlock &block, const CBlockIndex* blockindex)
 {
     Object obj;
@@ -368,6 +403,7 @@ Value BlockToValue(CBlock &block, const CBlockIndex* blockindex)
     obj.push_back(Pair("merkleroot", block.hashMerkleRoot.ToString().c_str()));
     obj.push_back(Pair("time", (uint64_t)block.nTime));
     obj.push_back(Pair("bits", (uint64_t)block.nBits));
+    obj.push_back(Pair("difficulty", GetDifficultyFromBits (block.nBits)));
     obj.push_back(Pair("nonce", (uint64_t)block.nNonce));
     obj.push_back(Pair("n_tx", (int)block.vtx.size()));
     obj.push_back(Pair("size", (int)::GetSerializeSize(block, SER_NETWORK)));
@@ -588,37 +624,6 @@ Value getconnectioncount(const Array& params, bool fHelp)
             "Returns the number of connections to other nodes.");
 
     return (int)vNodes.size();
-}
-
-
-double GetDifficulty(int algo)
-{
-    // Floating point number that is a multiple of the minimum difficulty,
-    // minimum difficulty = 1.0.
-    const CBlockIndex* blockindex = GetLastBlockIndexForAlgo(pindexBest, algo);
-    unsigned int nBits;
-    if (blockindex == NULL)
-        nBits = bnInitialHashTarget[algo].GetCompact();
-    else
-        nBits = blockindex->nBits;
-
-    int nShift = (nBits >> 24) & 0xff;
-
-    double dDiff =
-        (double)0x0000ffff / (double)(nBits & 0x00ffffff);
-
-    while (nShift < 29)
-    {
-        dDiff *= 256.0;
-        nShift++;
-    }
-    while (nShift > 29)
-    {
-        dDiff /= 256.0;
-        nShift--;
-    }
-
-    return dDiff;
 }
 
 Value getdifficulty(const Array& params, bool fHelp)
@@ -1743,66 +1748,6 @@ Value listtransactions(const Array& params, bool fHelp)
     return ret;
 }
 
-/* Analyse the UTXO set.  This possibly takes a very long time.  */
-Value analyseutxo (const Array& params, bool fHelp)
-{
-  if (fHelp || params.size() > 0)
-    throw std::runtime_error (
-          "analyseutxo\n"
-          "Look through the UTXO and construct certain data about it.");
-
-  CTxDB txdb("r");
-
-  unsigned txCnt = 0;
-  unsigned txoCnt = 0;
-  int64_t amount = 0;
-  const CBlockIndex* pInd = pindexBest;
-  const unsigned startingHeight = pInd->nHeight;
-  for (; pInd; pInd = pInd->pprev)
-    {
-      printf ("Analyse UTXO at block height %d...\n", pInd->nHeight);
-      std::vector<const CTransaction*> vTxs;
-
-      CBlock block;
-      block.ReadFromDisk (pInd);
-
-      for (unsigned i = 0; i < block.vtx.size (); ++i)
-        vTxs.push_back (&block.vtx[i]);
-      for (unsigned i = 0; i < block.vgametx.size (); ++i)
-        vTxs.push_back (&block.vgametx[i]);
-
-      for (unsigned i = 0; i < vTxs.size (); ++i)
-        {
-          CTxIndex txindex;
-          if (!txdb.ReadTxIndex (vTxs[i]->GetHash (), txindex))
-            throw std::runtime_error ("ReadTxIndex failed.");
-
-          bool hasUnspent = false;
-          for (unsigned j = 0; j < vTxs[i]->vout.size (); ++j)
-            if (txindex.vSpent[j].IsNull ())
-              {
-                hasUnspent = true;
-                ++txoCnt;
-                amount += vTxs[i]->vout[j].nValue;
-              }
-          if (hasUnspent)
-            ++txCnt;
-        }
-
-      /* Since this is an async RPC call, give the main thread a chance
-         to interrupt this thread in case the server is going to shut down.  */
-      boost::this_thread::interruption_point ();
-    }
-
-  Object res;
-  res.push_back (Pair ("height", static_cast<int> (startingHeight)));
-  res.push_back (Pair ("ntx", static_cast<int> (txCnt)));
-  res.push_back (Pair ("ntxout", static_cast<int> (txoCnt)));
-  res.push_back (Pair ("total", ValueFromAmount (amount)));
-
-  return res;
-}
-
 Value listaccounts(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() > 1)
@@ -1930,7 +1875,7 @@ void ThreadCleanWalletPassphrase(void* parg)
                 break;
 
             cs_nWalletUnlockTime.Leave();
-            Sleep(nToSleep);
+            MilliSleep(nToSleep);
             cs_nWalletUnlockTime.Enter();
 
         } while(1);
@@ -2848,15 +2793,76 @@ void ScriptPubKeyToJSON(const CScript& scriptPubKey, Object& out)
     string address;
     int nRequired = 1;
 
-    out.push_back(Pair("asm", scriptPubKey.ToString()));
+    /* If this is a name transaction, try to strip off the initial
+       script and decode the rest for better results.  */
+    std::string nameAsmPrefix = "";
+    CScript script(scriptPubKey);
+    int op;
+    vector<vector<unsigned char> > vvch;
+    CScript::const_iterator pc = script.begin();
+    if (DecodeNameScript(script, op, vvch, pc))
+    {
+        Object nameOp;
+
+        switch (op)
+        {
+        case OP_NAME_NEW:
+        {
+            assert(vvch.size() == 1);
+            const std::string rand = HexStr(vvch[0].begin(), vvch[0].end());
+            nameOp.push_back(Pair("op", "name_new"));
+            nameOp.push_back(Pair("rand", rand));
+            break;
+        }
+
+        case OP_NAME_FIRSTUPDATE:
+        {
+            assert(vvch.size() == 3);
+            const std::string name(vvch[0].begin(), vvch[0].end());
+            const std::string rand = HexStr(vvch[1].begin(), vvch[1].end());
+            const std::string val(vvch[2].begin(), vvch[2].end());
+            nameOp.push_back(Pair("op", "name_firstupdate"));
+            nameOp.push_back(Pair("name", name));
+            nameOp.push_back(Pair("rand", rand));
+            nameOp.push_back(Pair("value", val));
+            break;
+        }
+
+        case OP_NAME_UPDATE:
+        {
+            assert(vvch.size() == 2);
+            const std::string name(vvch[0].begin(), vvch[0].end());
+            const std::string val(vvch[1].begin(), vvch[1].end());
+            nameOp.push_back(Pair("op", "name_update"));
+            nameOp.push_back(Pair("name", name));
+            nameOp.push_back(Pair("value", val));
+            break;
+        }
+
+        default:
+            nameOp.push_back(Pair("op", "unknown"));
+            break;
+        }
+
+        out.push_back(Pair("nameOp", nameOp));
+        nameAsmPrefix = "NAME_OPERATION ";
+        script = CScript(pc, script.end());
+    }
+
+    /* Write out the results.  */
+    out.push_back(Pair("asm", nameAsmPrefix + script.ToString()));
     out.push_back(Pair("hex", HexStr(scriptPubKey.begin(), scriptPubKey.end())));
 
     //if (!ExtractDestinations(scriptPubKey, type, addresses, nRequired))
-    if (!ExtractDestination(scriptPubKey, address))
+    if (!ExtractDestination(script, address))
     {
         out.push_back(Pair("type", "nonstandard" /*GetTxnOutputType(TX_NONSTANDARD)*/ ));
         return;
     }
+
+    /* Note:  ExtractDestination handles both pubkey hash and pubkey,
+       but the code below prints pubkeyhash as type in both cases.  That
+       is not so big a deal, presumably.  */
 
     out.push_back(Pair("reqSigs", nRequired));
     out.push_back(Pair("type", "pubkeyhash" /*GetTxnOutputType(type)*/ ));
@@ -2874,46 +2880,15 @@ void TxToJSON(const CTransaction& tx, const uint256 hashBlock, Object& entry)
     entry.push_back(Pair("txid", tx.GetHash().GetHex()));
     entry.push_back(Pair("version", tx.nVersion));
     entry.push_back(Pair("locktime", (boost::int64_t)tx.nLockTime));
-    Array vin;
-    BOOST_FOREACH(const CTxIn& txin, tx.vin)
-    {
-        Object in;
-        if (tx.IsCoinBase())
-            in.push_back(Pair("coinbase", HexStr(txin.scriptSig.begin(), txin.scriptSig.end())));
-        else
-        {
-            in.push_back(Pair("txid", txin.prevout.hash.GetHex()));
-            in.push_back(Pair("vout", (boost::int64_t)txin.prevout.n));
-            Object o;
-            o.push_back(Pair("asm", txin.scriptSig.ToString()));
-            o.push_back(Pair("hex", HexStr(txin.scriptSig.begin(), txin.scriptSig.end())));
-            in.push_back(Pair("scriptSig", o));
-        }
-        in.push_back(Pair("sequence", (boost::int64_t)txin.nSequence));
-        vin.push_back(in);
-    }
-    entry.push_back(Pair("vin", vin));
-    Array vout;
-    for (unsigned int i = 0; i < tx.vout.size(); i++)
-    {
-        const CTxOut& txout = tx.vout[i];
-        Object out;
-        out.push_back(Pair("value", ValueFromAmount(txout.nValue)));
-        out.push_back(Pair("n", (boost::int64_t)i));
-        Object o;
-        ScriptPubKeyToJSON(txout.scriptPubKey, o);
-        out.push_back(Pair("scriptPubKey", o));
-        vout.push_back(out);
-    }
-    entry.push_back(Pair("vout", vout));
 
+    const CBlockIndex* pindex = NULL;
     if (hashBlock != 0)
     {
         entry.push_back(Pair("blockhash", hashBlock.GetHex()));
-        map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashBlock);
+        map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(hashBlock);
         if (mi != mapBlockIndex.end() && (*mi).second)
         {
-            CBlockIndex* pindex = (*mi).second;
+            pindex = (*mi).second;
             if (pindex->IsInMainChain())
             {
                 entry.push_back(Pair("confirmations", 1 + nBestHeight - pindex->nHeight));
@@ -2924,6 +2899,76 @@ void TxToJSON(const CTransaction& tx, const uint256 hashBlock, Object& entry)
                 entry.push_back(Pair("confirmations", 0));
         }
     }
+
+    Array vin;
+    int64 nValueIn = 0;
+    bool fullValueIn = true;
+    BOOST_FOREACH(const CTxIn& txin, tx.vin)
+    {
+        Object in;
+        if (tx.IsCoinBase())
+        {
+            in.push_back(Pair("coinbase", HexStr(txin.scriptSig.begin(), txin.scriptSig.end())));
+
+            if (pindex)
+            {
+                const int64 val = GetBlockValue(pindex->nHeight, 0);
+                nValueIn += val;
+                in.push_back(Pair("value", ValueFromAmount(val)));
+            }
+            else
+                fullValueIn = false;
+        }
+        else
+        {
+            in.push_back(Pair("txid", txin.prevout.hash.GetHex()));
+            in.push_back(Pair("vout", (boost::int64_t)txin.prevout.n));
+            Object o;
+            o.push_back(Pair("asm", txin.scriptSig.ToString()));
+            o.push_back(Pair("hex", HexStr(txin.scriptSig.begin(), txin.scriptSig.end())));
+            in.push_back(Pair("scriptSig", o));
+
+            /* Try to retrieve previous transaction output to find
+               its value in order to calculate transaction fees.  */
+            CTransaction prevTx;
+            uint256 prevHashBlock = 0;
+            if (GetTransaction(txin.prevout.hash, prevTx, prevHashBlock))
+            {
+                if (prevTx.vout.size () > txin.prevout.n)
+                {
+                    const int64 val = prevTx.vout[txin.prevout.n].nValue;
+                    nValueIn += val;
+                    in.push_back(Pair("value", ValueFromAmount(val)));
+                }
+                else
+                    fullValueIn = false;
+            }
+            else
+                fullValueIn = false;
+        }
+        in.push_back(Pair("sequence", (boost::int64_t)txin.nSequence));
+        vin.push_back(in);
+    }
+    entry.push_back(Pair("vin", vin));
+
+    Array vout;
+    int64 nValueOut = 0;
+    for (unsigned int i = 0; i < tx.vout.size(); i++)
+    {
+        const CTxOut& txout = tx.vout[i];
+        nValueOut += txout.nValue;
+        Object out;
+        out.push_back(Pair("value", ValueFromAmount(txout.nValue)));
+        out.push_back(Pair("n", (boost::int64_t)i));
+        Object o;
+        ScriptPubKeyToJSON(txout.scriptPubKey, o);
+        out.push_back(Pair("scriptPubKey", o));
+        vout.push_back(out);
+    }
+    entry.push_back(Pair("vout", vout));
+
+    if (fullValueIn)
+        entry.push_back(Pair("fees", ValueFromAmount(nValueIn - nValueOut)));
 }
 
 Value getrawtransaction(const Array& params, bool fHelp)
@@ -3041,17 +3086,23 @@ Value listunspent(const Array& params, bool fHelp)
 
 Value createrawtransaction(const Array& params, bool fHelp)
 {
-    if (fHelp || params.size() != 2)
+    if (fHelp || (params.size() != 2 && params.size() != 3))
         throw runtime_error(
             "createrawtransaction [{\"txid\":txid,\"vout\":n},...] {address:amount,...}\n"
+            "optional third argument:\n"
+            "  {\"op\":\"name_update\", \"name\":name, \"value\":value, \"address\":address}\n\n"
             "Create a transaction spending given inputs\n"
             "(array of objects containing transaction id and output number),\n"
             "sending to given address(es).\n"
-            "Returns hex-encoded raw transaction.\n"
+            "Optionally, a name_update operation can be performed.\n\n"
+            "Returns hex-encoded raw transaction.\n\n"
             "Note that the transaction's inputs are not signed, and\n"
             "it is not stored in the wallet or transmitted to the network.");
 
-    RPCTypeCheck(params, boost::assign::list_of(array_type)(obj_type));
+    if (params.size() == 2)
+        RPCTypeCheck(params, boost::assign::list_of(array_type)(obj_type));
+    else
+        RPCTypeCheck(params, boost::assign::list_of(array_type)(obj_type)(obj_type));
 
     Array inputs = params[0].get_array();
     Object sendTo = params[1].get_obj();
@@ -3092,6 +3143,12 @@ Value createrawtransaction(const Array& params, bool fHelp)
 
         CTxOut out(nAmount, scriptPubKey);
         rawTx.vout.push_back(out);
+    }
+
+    if (params.size() == 3)
+    {
+        Object nameOp = params[2].get_obj();
+        AddRawTxNameOperation(rawTx, nameOp);
     }
 
     CDataStream ss(SER_NETWORK, VERSION);
@@ -3342,8 +3399,8 @@ Value sendrawtransaction(const Array& params, bool fHelp)
     else
     {
         // push to local node
-        CTxDB txdb("r");
-        if (!tx.AcceptToMemoryPool(txdb, true, false))
+        DatabaseSet dbset("r");
+        if (!tx.AcceptToMemoryPool (dbset, true, false))
             throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX rejected");
 
         SyncWithWallets(tx, NULL, true);
@@ -3426,7 +3483,6 @@ pair<string, rpcfn_type> pCallTable[] =
     make_pair("gettransaction",        &gettransaction),
     make_pair("listtransactions",      &listtransactions),
     make_pair("listsinceblock",        &listsinceblock),
-    make_pair("analyseutxo",           &analyseutxo),
     make_pair("getwork",               &getwork),
     make_pair("getworkaux",            &getworkaux),
     make_pair("getauxblock",           &getauxblock),
@@ -4035,7 +4091,7 @@ void ThreadRPCServer2(void* parg)
         {
             // Deter brute-forcing short passwords
             if (mapArgs["-rpcpassword"].size() < 15)
-                Sleep(50);
+                MilliSleep(50);
 
             out->getStream() << HTTPReply(401, "") << std::flush;
             printf("ThreadRPCServer incorrect password attempt\n");
@@ -4266,10 +4322,13 @@ void RPCConvertValues(const std::string &strMethod, json_spirit::Array &params)
     if (strMethod == "getrawtransaction"      && n > 1) ConvertTo<boost::int64_t>(params[1]);
     if (strMethod == "createrawtransaction"   && n > 0) ConvertTo<Array>(params[0]);
     if (strMethod == "createrawtransaction"   && n > 1) ConvertTo<Object>(params[1]);
+    if (strMethod == "createrawtransaction"   && n > 2) ConvertTo<Object>(params[2]);
     if (strMethod == "signrawtransaction"     && n > 1) ConvertTo<Array>(params[1], true);
     if (strMethod == "signrawtransaction"     && n > 2) ConvertTo<Array>(params[2], true);
     if (strMethod == "game_getstate"          && n > 0) ConvertTo<boost::int64_t>(params[0]);
     if (strMethod == "game_getplayerstate"    && n > 1) ConvertTo<boost::int64_t>(params[1]);
+    if (strMethod == "game_getpath"           && n > 0) ConvertTo<Array>(params[0]);
+    if (strMethod == "game_getpath"           && n > 1) ConvertTo<Array>(params[1]);
 }
 
 int CommandLineRPC(int argc, char *argv[])

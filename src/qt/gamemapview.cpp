@@ -3,7 +3,6 @@
 #include "../gamestate.h"
 #include "../gamemap.h"
 #include "../util.h"
-
 #include <QImage>
 #include <QGraphicsItem>
 #include <QGraphicsSimpleTextItem>
@@ -646,7 +645,7 @@ void GameMapView::mousePressEvent(QMouseEvent *event)
         int x = p.x() / TILE_SIZE;
         int y = p.y() / TILE_SIZE;
         if (IsInsideMap(x, y))
-            emit tileClicked(x, y);
+            emit tileClicked(x, y, event->modifiers().testFlag( Qt::ControlModifier ));
     }
     else if (event->button() == Qt::RightButton)
     {
@@ -681,6 +680,12 @@ void GameMapView::mouseMoveEvent(QMouseEvent *event)
         horizontalScrollBar()->setValue(horizontalScrollBar()->value() + pan_pos.x() - event->pos().x());
         verticalScrollBar()->setValue(verticalScrollBar()->value() + pan_pos.y() - event->pos().y());
         pan_pos = event->pos();
+    }
+	QPoint p = mapToScene(event->pos()).toPoint();
+	int x = p.x() / TILE_SIZE;
+	int y = p.y() / TILE_SIZE;
+    if (IsInsideMap(x, y)) {
+    	emit tileHover(x, y);
     }
     event->accept();
 }

@@ -1,7 +1,7 @@
 #ifndef GAMEMAPVIEW_H
 #define GAMEMAPVIEW_H
 
-#include "gamemovecreator.h"
+#include "../gamemovecreator.h"
 
 #include <QGraphicsView>
 #include <QGraphicsScene>
@@ -45,7 +45,8 @@ public slots:
 
 signals:
 
-    void tileClicked(int x, int y);
+    void tileClicked(int x, int y, bool ctrlPressed);
+    void tileHover(int x, int y);
 
 protected:
 

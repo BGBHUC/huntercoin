@@ -9,12 +9,12 @@ MINGW=$(shell uname -s|grep -i mingw32)
 DEFS += -DBOOST_THREAD_USE_LIB
 
 INCLUDEPATHS= \
-	-I../libs/openssl-1.0.1g/include \
+	-I../libs/openssl-1.0.1h/include \
 	-I../libs/db-4.7.25.NC/build_unix \
 	-I../libs/boost_1_50_0
 
 LIBPATHS= \
-	-L../libs/openssl-1.0.1g \
+	-L../libs/openssl-1.0.1h \
 	-L../libs/db-4.7.25.NC/build_unix \
 	-L../libs/boost_1_50_0/stage/lib
 
@@ -79,6 +79,7 @@ OBJS= \
     obj/gamemap.o \
     obj/gamedb.o \
     obj/gametx.o \
+    obj/gamemovecreator.o \
     cryptopp/obj/sha.o \
     cryptopp/obj/cpu.o
 
@@ -99,15 +100,17 @@ cryptopp/obj/%.o: cryptopp/%.cpp
 obj/%.o: %.cpp $(HEADERS)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
-obj/huntercoin.o: huntercoin.h gamestate.h gamedb.h
+obj/huntercoin.o: huntercoin.h gamestate.h gamedb.h gamemovecreator.h
 
-obj/gamestate.o: gamestate.h gamemap.h
+obj/gamestate.o: huntercoin.h gamestate.h gamemap.h
 
 obj/gamemap.o: gamemap.h
 
 obj/gamedb.o: gamestate.h gamedb.h gametx.h
 
 obj/gametx.o: gametx.h gamestate.h
+
+obj/gamemovecreator.o: gamemovecreator.h gamestate.h gamemap.h
 
 huntercoind: $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $(LIBPATHS) $^ $(LIBS)

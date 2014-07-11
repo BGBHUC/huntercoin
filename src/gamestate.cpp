@@ -8,24 +8,22 @@
 #include <boost/assign/list_of.hpp>
 #include <boost/foreach.hpp>
 
-#include "util.h"
-#include "bignum.h"
-#include "base58.h"
+#include "headers.h"
+#include "huntercoin.h"
 
 using namespace Game;
 
 json_spirit::Value ValueFromAmount(int64 amount);
 
-bool IsValidPlayerName(const PlayerID &player)
-{
-    // Check player name validity
-    // Can contain letters, digits, underscore, hyphen and whitespace
-    // Cannot contain double whitespaces or start/end with whitespace
-    using namespace boost::xpressive;
-    static sregex regex = sregex::compile("^([a-zA-Z0-9_-]+ )*[a-zA-Z0-9_-]+$");
-    smatch match;
-    return regex_search(player, match, regex);
-}
+/* Parameters that determine when a poison-disaster will happen.  The
+   probability is 1/x at each block between min and max time.  */
+static const unsigned PDISASTER_MIN_TIME = 1440;
+static const unsigned PDISASTER_MAX_TIME = 12 * 1440;
+static const unsigned PDISASTER_PROBABILITY = 10000;
+
+/* Parameters about how long a poisoned player may still live.  */
+static const unsigned POISON_MIN_LIFE = 1;
+static const unsigned POISON_MAX_LIFE = 50;
 
 namespace Game
 {
@@ -62,6 +60,16 @@ public:
             state = state0;
         }
         return state.DivideGetRemainder(modulo).getint();
+    }
+
+    /* Get an integer number in [a, b].  */
+    int GetIntRnd (int a, int b)
+    {
+      assert (a <= b);
+      const int mod = (b - a + 1);
+      const int res = GetIntRnd (mod) + a;
+      assert (res >= a && res <= b);
+      return res;
     }
 
 private:
@@ -269,24 +277,34 @@ std::string Move::AddressOperationPermission(const GameState &state) const
     return mi->second.addressLock;
 }
 
-void Move::ApplySpawn(GameState &state, RandomGenerator &rnd) const
+void
+Move::ApplySpawn (GameState &state, RandomGenerator &rnd) const
 {
-    PlayerState &pl = state.players[player];
-    if (pl.next_character_index == 0)
-    {
-        pl.color = color;
-        for (int i = 0; i < NUM_INITIAL_CHARACTERS; i++)
-            pl.SpawnCharacter(rnd);
-    }
+  PlayerState &pl = state.players[player];
+  if (pl.next_character_index == 0)
+  {
+    pl.color = color;
+    assert (pl.coinAmount == -1 && coinAmount >= 0);
+    pl.coinAmount = coinAmount;
+
+    const unsigned limit = state.GetNumInitialCharacters ();
+    for (unsigned i = 0; i < limit; i++)
+      pl.SpawnCharacter (rnd);
+  }
 }
 
 void Move::ApplyWaypoints(GameState &state) const
 {
-    PlayerState &pl = state.players[player];
+    std::map<PlayerID, PlayerState>::iterator pl;
+    pl = state.players.find (player);
+    if (pl == state.players.end ())
+      return;
+
     BOOST_FOREACH(const PAIRTYPE(int, std::vector<Coord>) &p, waypoints)
     {
-        std::map<int, CharacterState>::iterator mi = pl.characters.find(p.first);
-        if (mi == pl.characters.end())
+        std::map<int, CharacterState>::iterator mi;
+        mi = pl->second.characters.find(p.first);
+        if (mi == pl->second.characters.end())
             continue;
         CharacterState &ch = mi->second;
         const std::vector<Coord> &wp = p.second;
@@ -532,6 +550,15 @@ json_spirit::Value PlayerState::ToJsonValue(int crown_index, bool dead /* = fals
 
     Object obj;
     obj.push_back(Pair("color", (int)color));
+    obj.push_back(Pair("coinAmount", ValueFromAmount(coinAmount)));
+
+    /* If the character is poisoned, write that out.  Otherwise just
+       leave the field off.  */
+    if (remainingLife > 0)
+      obj.push_back (Pair("poison", remainingLife));
+    else
+      assert (remainingLife == -1);
+
     if (!message.empty())
     {
         obj.push_back(Pair("msg", message));
@@ -592,27 +619,22 @@ json_spirit::Value CharacterState::ToJsonValue(bool has_crown) const
 
 GameState::GameState()
 {
-    nVersion = VERSION;
     crownPos.x = CROWN_START_X;
     crownPos.y = CROWN_START_Y;
+    lostCoins = 0;
     nHeight = -1;
+    nDisasterHeight = -1;
     hashBlock = 0;
 }
 
-void GameState::UpdateVersion()
+void
+GameState::UpdateVersion(int oldVersion)
 {
-    if (nVersion < 1000500)
-    {
-        std::set<PlayerID> toErase;
+  /* Last version change is beyond the last version where the game db
+     is fully reconstructed.  */
+  assert (oldVersion >= 1001100);
 
-        // Erase dead players (note: during upgrade their chat messages are lost, need to delete&rescan game.dat to recover them)
-        BOOST_FOREACH(const PAIRTYPE(PlayerID, PlayerState) &p, players)
-            if (p.second.characters.empty())
-                toErase.insert(p.first);
-        BOOST_FOREACH(const PlayerID &p, toErase)
-            players.erase(p);
-    }
-    nVersion = VERSION;
+  /* No upgrades to game state are necessary since this change.  */
 }
 
 json_spirit::Value GameState::ToJsonValue() const
@@ -668,8 +690,10 @@ json_spirit::Value GameState::ToJsonValue() const
     }
     obj.push_back(Pair("crown", subobj));
 
-    obj.push_back(Pair("height", nHeight));
-    obj.push_back(Pair("hashBlock", hashBlock.ToString().c_str()));
+    obj.push_back (Pair("lostCoins", ValueFromAmount (lostCoins)));
+    obj.push_back (Pair("height", nHeight));
+    obj.push_back (Pair("disasterHeight", nDisasterHeight));
+    obj.push_back (Pair("hashBlock", hashBlock.ToString().c_str()));
 
     return obj;
 }
@@ -776,13 +800,36 @@ void GameState::UpdateCrownState(bool &respawn_crown)
     }
 }
 
-void GameState::CrownBonus(int64 nAmount)
+void
+GameState::CrownBonus (int64 nAmount)
 {
-    if (!crownHolder.player.empty())
+  if (!crownHolder.player.empty ())
     {
-        CharacterState &ch = players[crownHolder.player].characters[crownHolder.index];
-        ch.loot.Collect(LootInfo(nAmount, nHeight), nHeight);
+      PlayerState& p = players[crownHolder.player];
+      CharacterState& ch = p.characters[crownHolder.index];
+      ch.loot.Collect (LootInfo(nAmount, nHeight), nHeight);
     }
+  else
+    lostCoins += nAmount;
+}
+
+unsigned
+GameState::GetNumInitialCharacters () const
+{
+  return (nHeight < FORK_HEIGHT_POISON ? 3 : 1);
+}
+
+int64
+GameState::GetCoinsOnMap () const
+{
+  int64 onMap = 0;
+  BOOST_FOREACH(const PAIRTYPE(Coord, LootInfo)& l, loot)
+    onMap += l.second.nAmount;
+  BOOST_FOREACH(const PAIRTYPE(PlayerID, PlayerState)& p, players)
+    BOOST_FOREACH(const PAIRTYPE(int, CharacterState)& pc, p.second.characters)
+      onMap += pc.second.loot.nAmount;
+
+  return onMap;
 }
 
 void GameState::CollectHearts(RandomGenerator &rnd)
@@ -861,7 +908,8 @@ void GameState::CollectCrown(RandomGenerator &rnd, bool respawn_crown)
 
 // Loot is pushed out from the spawn area to avoid some ambiguities with banking rules (as spawn areas are also banks)
 // Note: the map must be constructed in such a way that there are no obstacles near spawn areas
-Coord PushCoordOutOfSpawnArea(const Coord &c)
+static Coord
+PushCoordOutOfSpawnArea(const Coord &c)
 {
     if (!IsInSpawnArea(c))
         return c;
@@ -889,6 +937,120 @@ Coord PushCoordOutOfSpawnArea(const Coord &c)
         return Coord(c.x, c.y - 1);
     else
         return c;     // Should not happen
+}
+
+void
+GameState::FinaliseKills (StepResult& step)
+{
+  const PlayerSet& killedPlayers = step.GetKilledPlayers ();
+  const KilledByMap& killedBy = step.GetKilledBy ();
+
+  /* Kill depending characters.  */
+  BOOST_FOREACH(const PlayerID& victim, killedPlayers)
+    {
+      const PlayerState& victimState = players.find (victim)->second;
+
+      /* If killed by the game for staying in the spawn area, then no tax.  */
+      const KilledByMap::const_iterator iter = killedBy.find (victim);
+      assert (iter != killedBy.end ());
+      const bool apply_tax = iter->second.HasDeathTax ();
+
+      /* Kill all alive characters of the player.  */
+      BOOST_FOREACH(const PAIRTYPE(int, CharacterState)& pc,
+                    victimState.characters)
+        {
+          const int i = pc.first;
+          const CharacterState& ch = pc.second;
+
+          int64 nAmount = ch.loot.nAmount;
+          if (i == 0)
+            nAmount += victimState.coinAmount;
+          if (nAmount > 0)
+            {
+              if (apply_tax)
+                {
+                  // Tax from killing: 4%
+                  const int64 nTax = nAmount / 25;
+                  step.nTaxAmount += nTax;
+                  nAmount -= nTax;
+                }
+
+              AddLoot (PushCoordOutOfSpawnArea (ch.coord), nAmount);
+            }
+        }
+    }
+
+  /* Erase killed players from the state.  */
+  BOOST_FOREACH(const PlayerID& victim, killedPlayers)
+    players.erase (victim);
+}
+
+bool
+GameState::CheckForDisaster (RandomGenerator& rng) const
+{
+  /* Before the hardfork, nothing should happen.  */
+  if (nHeight < FORK_HEIGHT_POISON)
+    return false;
+
+  /* Enforce max/min times.  */
+  const int dist = nHeight - nDisasterHeight;
+  assert (dist > 0);
+  if (dist < PDISASTER_MIN_TIME)
+    return false;
+  if (dist >= PDISASTER_MAX_TIME)
+    return true;
+
+  /* Check random chance.  */
+  return (rng.GetIntRnd (PDISASTER_PROBABILITY) == 0);
+}
+
+void
+GameState::ApplyPoison (RandomGenerator& rng)
+{
+  /* Set random life expectations for every player on the map.  */
+  BOOST_FOREACH(PAIRTYPE(const PlayerID, PlayerState)& p, players)
+    {
+      /* Disasters should be so far apart, that all currently alive players
+         are not yet poisoned.  Check this.  In case we introduce a general
+         expiry, this can be changed accordingly -- but make sure that
+         poisoning doesn't actually *increase* the life expectation.  */
+      assert (p.second.remainingLife == -1);
+
+      p.second.remainingLife = rng.GetIntRnd (POISON_MIN_LIFE, POISON_MAX_LIFE);
+    }
+
+  /* Reset disaster counter.  */
+  nDisasterHeight = nHeight;
+}
+
+void
+GameState::DecrementLife (StepResult& step)
+{
+  BOOST_FOREACH(PAIRTYPE(const PlayerID, PlayerState)& p, players)
+    {
+      if (p.second.remainingLife == -1)
+        continue;
+
+      assert (p.second.remainingLife > 0);
+      --p.second.remainingLife;
+
+      if (p.second.remainingLife == 0)
+        {
+          const KilledByInfo killer(KilledByInfo::KILLED_POISON);
+          step.KillPlayer (p.first, killer);
+        }
+    }
+}
+
+void
+CollectedBounty::UpdateAddress (const GameState& state)
+{
+  const PlayerID& p = character.player;
+  const PlayerStateMap::const_iterator i = state.players.find (p);
+  if (i == state.players.end ())
+    return;
+
+  address = i->second.address;
 }
 
 struct AttackableCharacter
@@ -924,7 +1086,11 @@ bool Game::PerformStep(const GameState &inState, const StepData &stepData, GameS
 
     outState = inState;
 
+    /* Initialise basic stuff.  The disaster height is set to the old
+       block's for now, but it may be reset later when we decide that
+       a disaster happens at this block.  */
     outState.nHeight = inState.nHeight + 1;
+    outState.nDisasterHeight = inState.nDisasterHeight;
     outState.hashBlock = stepData.newHash;
     outState.dead_players_chat.clear();
 
@@ -956,29 +1122,34 @@ bool Game::PerformStep(const GameState &inState, const StepData &stepData, GameS
                     for (std::multimap<Coord, AttackableCharacter>::const_iterator it = its.first; it != its.second; it++)
                     {
                         const AttackableCharacter &a = it->second;
+                        PlayerState& victim = outState.players[*a.name];
+
                         if (a.color == pl.color)
                             continue;  // Do not kill same color
                         if (a.index == 0)
                         {
-                            stepResult.killedBy.insert(std::make_pair(*a.name, chid));
-                            stepResult.killedPlayers.insert(*a.name);
+                            const KilledByInfo killer(chid);
+                            stepResult.KillPlayer (*a.name, killer);
                         }
-                        if (outState.players[*a.name].characters.count(a.index))
+                        if (victim.characters.count(a.index))
                         {
-                            CharacterState &ch = outState.players[*a.name].characters[a.index];
+                            const CharacterState& ch = victim.characters[a.index];
                             // Drop loot
                             int64 nAmount = ch.loot.nAmount;
                             if (a.index == 0)
-                                nAmount += stepData.nNameCoinAmount;
+                              {
+                                assert (victim.coinAmount >= 0);
+                                nAmount += victim.coinAmount;
+                              }
                             if (nAmount > 0)
-                            {
+                              {
                                 // Tax from killing: 4%
                                 int64 nTax = nAmount / 25;
                                 stepResult.nTaxAmount += nTax;
                                 nAmount -= nTax;
                                 outState.AddLoot(PushCoordOutOfSpawnArea(ch.coord), nAmount);
-                            }
-                            outState.players[*a.name].characters.erase(a.index);
+                              }
+                            victim.characters.erase(a.index);
                         }
                     }
                 }
@@ -988,21 +1159,24 @@ bool Game::PerformStep(const GameState &inState, const StepData &stepData, GameS
                 // Drop loot
                 int64 nAmount = pl.characters.find(i)->second.loot.nAmount;
                 if (i == 0)
-                    nAmount += stepData.nNameCoinAmount;
+                  {
+                    assert (pl.coinAmount >= 0);
+                    nAmount += pl.coinAmount;
+                  }
                 if (nAmount > 0)
-                {
+                  {
                     // Tax from killing: 4%
                     int64 nTax = nAmount / 25;
                     stepResult.nTaxAmount += nTax;
                     nAmount -= nTax;
                     outState.AddLoot(PushCoordOutOfSpawnArea(pl.characters.find(i)->second.coord), nAmount);
-                }
+                  }
                 outState.players[m.player].characters.erase(i);
             }
             if (i == 0)
             {
-                stepResult.killedPlayers.insert(m.player);
-                stepResult.killedBy.insert(std::make_pair(m.player, CharacterID(m.player, i)));
+                const KilledByInfo killer(CharacterID(m.player, i));
+                stepResult.KillPlayer (m.player, killer);
             }
         }
     }
@@ -1025,8 +1199,11 @@ bool Game::PerformStep(const GameState &inState, const StepData &stepData, GameS
                     int64 nAmount = ch.loot.nAmount;
                     if (i == 0)
                     {
-                        nAmount += stepData.nNameCoinAmount;
-                        stepResult.killedPlayers.insert(p.first);
+                        assert (p.second.coinAmount >= 0);
+                        nAmount += p.second.coinAmount;
+
+                        const KilledByInfo killer(KilledByInfo::KILLED_SPAWN);
+                        stepResult.KillPlayer (p.first, killer);
                     }
                     if (nAmount > 0)
                         outState.AddLoot(PushCoordOutOfSpawnArea(ch.coord), nAmount);
@@ -1040,45 +1217,18 @@ bool Game::PerformStep(const GameState &inState, const StepData &stepData, GameS
             p.second.characters.erase(i);
     }
 
-    BOOST_FOREACH(const PlayerID &victim, stepResult.killedPlayers)
-    {
-        const PlayerState &victimState = outState.players.find(victim)->second;
+    /* Decrement poison life expectation and kill players when it
+       has dropped to zero.  */
+    outState.DecrementLife (stepResult);
 
-        // If killed by the game for staying in the spawn area, then no tax
-        bool apply_tax = stepResult.killedBy.count(victim) != 0;
+    /* Finalise the kills.  */
+    outState.FinaliseKills (stepResult);
 
-        // Kill all alive characters of the player
-        BOOST_FOREACH(const PAIRTYPE(int, CharacterState) &pc, victimState.characters)
-        {
-            int i = pc.first;
-            const CharacterState &ch = pc.second;
-
-            assert(i != 0);  // If player is killed, main character must have been killed
-
-            int64 nAmount = ch.loot.nAmount;
-            if (nAmount > 0)
-            {
-                if (apply_tax)
-                {
-                    // Tax from killing: 4%
-                    int64 nTax = nAmount / 25;
-                    stepResult.nTaxAmount += nTax;
-                    nAmount -= nTax;
-                }
-
-                outState.AddLoot(PushCoordOutOfSpawnArea(ch.coord), nAmount);
-            }
-        }
-    }
-
-    // Apply updates to target coordinate
+    /* Apply updates to target coordinate.  This ignores already
+       killed players.  */
     BOOST_FOREACH(const Move &m, stepData.vMoves)
         if (!m.IsSpawn())
             m.ApplyWaypoints(outState);
-
-    // Erase killed players
-    BOOST_FOREACH(const PlayerID &victim, stepResult.killedPlayers)
-        outState.players.erase(victim);
 
     // For all alive players perform path-finding
     BOOST_FOREACH(PAIRTYPE(const PlayerID, PlayerState) &p, outState.players)
@@ -1105,7 +1255,8 @@ bool Game::PerformStep(const GameState &inState, const StepData &stepData, GameS
                 stepResult.nTaxAmount += nTax;
                 ch.loot.nAmount -= nTax;
 
-                stepResult.bounties[CharacterID(p.first, i)] = ch.loot;
+                CollectedBounty b(p.first, i, ch.loot, p.second.address);
+                stepResult.bounties.push_back (b);
                 ch.loot = CollectedLootInfo();
             }
         }
@@ -1117,6 +1268,18 @@ bool Game::PerformStep(const GameState &inState, const StepData &stepData, GameS
 
     RandomGenerator rnd(outState.hashBlock);
 
+    /* Decide about whether or not this will be a disaster.  It should be
+       the first action done with the RNG, so that it is possible to
+       verify whether or not a block hash leads to a disaster
+       relatively easily.  */
+    const bool isDisaster = outState.CheckForDisaster (rnd);
+    if (isDisaster)
+      {
+        printf ("POISON DISASTER @%d!\n", outState.nHeight);
+        outState.ApplyPoison (rnd);
+        assert (outState.nHeight == outState.nDisasterHeight);
+      }
+
     // Spawn new players
     BOOST_FOREACH(const Move &m, stepData.vMoves)
         if (m.IsSpawn())
@@ -1125,6 +1288,12 @@ bool Game::PerformStep(const GameState &inState, const StepData &stepData, GameS
     // Apply address & message updates
     BOOST_FOREACH(const Move &m, stepData.vMoves)
         m.ApplyCommon(outState);
+
+    /* In the (rare) case that a player collected a bounty, is still alive
+       and changed the reward address at the same time, make sure that the
+       bounty is paid to the new address to match the old network behaviour.  */
+    BOOST_FOREACH(CollectedBounty& bounty, stepResult.bounties)
+      bounty.UpdateAddress (outState);
 
     // Set colors for dead players, so their messages can be shown in the chat window
     BOOST_FOREACH(PAIRTYPE(const PlayerID, PlayerState) &p, outState.dead_players_chat)

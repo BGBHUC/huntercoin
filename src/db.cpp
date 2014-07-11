@@ -5,7 +5,7 @@
 #include "headers.h"
 #include "db.h"
 #include "net.h"
-#include "auxpow.h"
+#include "auxpow.h" // Fixes a linker issue with GCC > 4.7.
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 
@@ -45,7 +45,8 @@ public:
 instance_of_cdbinit;
 
 
-CDB::CDB(const char* pszFile, const char* pszMode) : pdb(NULL)
+CDB::CDB(const char* pszFile, const char* pszMode)
+  : pdb(NULL), nVersion(VERSION)
 {
     int ret;
     if (pszFile == NULL)
@@ -74,8 +75,8 @@ CDB::CDB(const char* pszFile, const char* pszMode) : pdb(NULL)
             dbenv.set_cachesize(nDbCache / 1024, (nDbCache % 1024)*1048576, 1);
             dbenv.set_lg_bsize(10485760);
             dbenv.set_lg_max(104857600);
-            dbenv.set_lk_max_locks(10000);
-            dbenv.set_lk_max_objects(10000);
+            dbenv.set_lk_max_locks(1000000);
+            dbenv.set_lk_max_objects(1000000);
             dbenv.set_errfile(fopen(strErrorFile.c_str(), "a")); /// debug
             dbenv.set_flags(DB_AUTO_COMMIT, 1);
             dbenv.set_flags(DB_TXN_WRITE_NOSYNC, 1);
@@ -132,30 +133,38 @@ CDB::CDB(const char* pszFile, const char* pszMode) : pdb(NULL)
     }
 }
 
-void CDB::Close()
+void
+CDB::Close ()
 {
-    if (!pdb)
-        return;
-    if (!vTxn.empty())
-        vTxn.front()->abort();
-    vTxn.clear();
-    pdb = NULL;
+  if (!pdb)
+    return;
+  if (!vTxn.empty () && ownTxn.front ())
+    vTxn.front ()->abort ();
+  vTxn.clear ();
+  ownTxn.clear ();
+  pdb = NULL;
 
-    // Flush database activity from memory pool to disk log
-    // wallet.dat is always flushed, the other files only every couple of minutes
-    // note Namecoin has more .dat files than Bitcoin
-    unsigned int nMinutes = 2;
-    if (fReadOnly)
-        nMinutes = 1;
-    if (strFile == "wallet.dat")
+  if (!fReadOnly)
+    {
+      /* Flush database activity from memory pool to disk log.
+         wallet.dat is always flushed, the other files only every couple
+         of minutes.
+         Note: Namecoin has more .dat files than Bitcoin.  */
+
+      unsigned int nMinutes = 2;
+      if (strFile == "wallet.dat")
         nMinutes = 0;
-    if ((strFile == "blkindex.dat" || strFile == "game.dat" || strFile == "nameindexfull.dat") && IsInitialBlockDownload())
+      else if ((strFile == "blkindex.dat" || strFile == "game.dat"
+                || strFile == "nameindexfull.dat")
+               && IsInitialBlockDownload ())
         nMinutes = 5;
 
-    dbenv.txn_checkpoint(nMinutes ? GetArg("-dblogsize", 100)*1024 : 0, nMinutes, 0);
+      dbenv.txn_checkpoint (nMinutes ? GetArg ("-dblogsize", 100) * 1024 : 0,
+                            nMinutes, 0);
+    }
 
-    CRITICAL_BLOCK(cs_db)
-        --mapFileUseCount[strFile];
+  CRITICAL_BLOCK(cs_db)
+    --mapFileUseCount[strFile];
 }
 
 void static CloseDb(const string& strFile)
@@ -181,7 +190,7 @@ void static CheckpointLSN(const std::string &strFile)
     dbenv.lsn_reset(strFile.c_str(), 0);
 }
 
-bool CDB::Rewrite(const string& strFile, const char* pszSkip)
+bool CDB::Rewrite(const string& strFile)
 {
     while (!fShutdown)
     {
@@ -231,15 +240,6 @@ bool CDB::Rewrite(const string& strFile, const char* pszSkip)
                                 fSuccess = false;
                                 break;
                             }
-                            if (pszSkip &&
-                                strncmp(&ssKey[0], pszSkip, std::min(ssKey.size(), strlen(pszSkip))) == 0)
-                                continue;
-                            if (strncmp(&ssKey[0], "\x07version", 8) == 0)
-                            {
-                                // Update version:
-                                ssValue.clear();
-                                ssValue << VERSION;
-                            }
                             Dbt datKey(&ssKey[0], ssKey.size());
                             Dbt datValue(&ssValue[0], ssValue.size());
                             int ret2 = pdbCopy->put(NULL, &datKey, &datValue, DB_NOOVERWRITE);
@@ -269,9 +269,101 @@ bool CDB::Rewrite(const string& strFile, const char* pszSkip)
                 return fSuccess;
             }
         }
-        Sleep(100);
+        MilliSleep(100);
     }
     return false;
+}
+
+/* Internal struct to accumulate db stats.  */
+struct DbstatsPerKeyData
+{
+  unsigned count;
+  size_t totalKeySize, totalValueSize;
+  size_t minKeySize, minValueSize;
+  size_t maxKeySize, maxValueSize;
+};
+
+void
+CDB::PrintStorageStats (const std::string& file)
+{
+  CCriticalBlock lock(cs_db);
+  CDB db(file.c_str (), "r");
+
+  /* Iterate over all entries in the database and keep track of how many
+     there are per different "key" (first string of the key) and how
+     large they are.  */
+  typedef std::map<std::string, DbstatsPerKeyData> DataMap;
+  DataMap data;
+
+  Dbc* pcursor = db.GetCursor ();
+  if (!pcursor)
+    {
+      printf ("Error creating cursor.\n");
+      return;
+    }
+
+  while (true)
+    {
+      CDataStream ssKey(SER_DISK, VERSION);
+      CDataStream ssValue(SER_DISK, VERSION);
+      const int ret = db.ReadAtCursor (pcursor, ssKey, ssValue, DB_NEXT);
+      if (ret == DB_NOTFOUND)
+        {
+          pcursor->close ();
+          break;
+        }
+      if (ret != 0)
+        {
+          pcursor->close ();
+          printf ("Error reading at cursor.\n");
+          return;
+        }
+
+      std::string key;
+      ssKey >> key;
+
+      /* Note that size reported will be the size *without* the already
+         read key string.  Should not matter much, as this information
+         is, of course, known anyway.  */
+      const size_t sizeKey = ssKey.size ();
+      const size_t sizeValue = ssValue.size ();
+
+      DataMap::iterator i = data.find (key);
+      if (i == data.end ())
+        {
+          DbstatsPerKeyData dat;
+          dat.count = 1;
+          dat.totalKeySize = dat.minKeySize = dat.maxKeySize = sizeKey;
+          dat.totalValueSize = dat.minValueSize = dat.maxValueSize = sizeValue;
+          data.insert (std::make_pair (key, dat));
+        }
+      else
+        {
+          DbstatsPerKeyData& dat = i->second;
+          assert (dat.count >= 1);
+          ++dat.count;
+
+          dat.totalKeySize += sizeKey;
+          dat.totalValueSize += sizeValue;
+
+          dat.minKeySize = std::min (dat.minKeySize, sizeKey);
+          dat.minValueSize = std::min (dat.minValueSize, sizeValue);
+
+          dat.maxKeySize = std::max (dat.maxKeySize, sizeKey);
+          dat.maxValueSize = std::max (dat.maxValueSize, sizeValue);
+        }
+    }
+
+  printf ("Database stats for '%s' collected:\n", file.c_str ());
+  for (DataMap::const_iterator i = data.begin (); i != data.end (); ++i)
+    {
+      const DbstatsPerKeyData& dat = i->second;
+      printf ("  %s: %u entries\n", i->first.c_str (), dat.count);
+      printf ("    keys:   %u total, %u min, %u max\n",
+              dat.totalKeySize, dat.minKeySize, dat.maxKeySize);
+      printf ("    values: %u total, %u min, %u max\n",
+              dat.totalValueSize, dat.minValueSize, dat.maxValueSize);
+    }
 }
 
 void DBFlush(bool fShutdown)
@@ -472,6 +564,7 @@ bool CTxDB::LoadBlockIndex()
         if (strType == "blockindex")
         {
             CDiskBlockIndex diskindex;
+            SetStreamVersion (ssValue);
             ssValue >> diskindex;
 
             // Construct block index object
@@ -487,7 +580,6 @@ bool CTxDB::LoadBlockIndex()
             pindexNew->nTime          = diskindex.nTime;
             pindexNew->nBits          = diskindex.nBits;
             pindexNew->nNonce         = diskindex.nNonce;
-            pindexNew->auxpow         = diskindex.auxpow;
 
             // Watch for genesis block
             if (pindexGenesisBlock == NULL && diskindex.GetBlockHash() == hashGenesisBlock)
@@ -554,8 +646,9 @@ bool CTxDB::LoadBlockIndex()
         CBlock block;
         if (!block.ReadFromDisk(pindexFork))
             return error("LoadBlockIndex() : block.ReadFromDisk failed");
-        CTxDB txdb;
-        block.SetBestChain(txdb, pindexFork);
+
+        DatabaseSet dbset;
+        block.SetBestChain (dbset, pindexFork);
     }
 
     return true;
@@ -617,6 +710,123 @@ bool CTxDB::FixTxIndexBug()
 
     if (!WriteVersion(VERSION))
         return error("FixTxIndexBug: WriteVersion failed");
+
+  return true;
+}
+
+/* Rewrite all txindex objects in the DB to update the data format.  */
+bool
+CTxDB::RewriteTxIndex (int oldVersion)
+{
+  /* Load everything in memory first.  This avoids conflicts between reading
+     from the cursor and writing to the DB.  */
+  std::map<uint256, CTxIndex> txindex;
+
+  /* Get database cursor.  */
+  Dbc* pcursor = GetCursor ();
+  if (!pcursor)
+    return error ("RewriteTxIndex: could not get DB cursor");
+
+  /* Load to memory.  This doesn't yet set the correct spent types,
+     but sets each spent output to SPENT_UNKNOWN.  */
+  printf ("Reading in old tx entries...\n");
+  unsigned int fFlags = DB_SET_RANGE;
+  loop
+    {
+      /* Read next record.  */
+      CDataStream ssKey(SER_DISK, oldVersion);
+      if (fFlags == DB_SET_RANGE)
+        ssKey << std::make_pair (std::string ("tx"), uint256 (0));
+      CDataStream ssValue(SER_DISK, oldVersion);
+      int ret = ReadAtCursor (pcursor, ssKey, ssValue, fFlags);
+      fFlags = DB_NEXT;
+      if (ret == DB_NOTFOUND)
+        break;
+      if (ret != 0)
+        return error ("RewriteTxIndex: ReadAtCursor failed, ret = %d", ret);
+
+      /* Unserialize.  */
+
+      std::string strType;
+      ssKey >> strType;
+      if (strType != "tx")
+        break;
+      uint256 hash;
+      ssKey >> hash;
+
+      CTxIndex obj;
+      ssValue >> obj;
+
+      /* Store in map.  */
+      assert (txindex.find (hash) == txindex.end ());
+      txindex.insert (std::make_pair (hash, obj));
+    }
+  pcursor->close ();
+
+  /* Go through all possible spending transactions and set their inputs'
+     spent type accordingly.  */
+  if (oldVersion < 1001000)
+    {
+      printf ("Fixing tx spent types...\n");
+      CBlockIndex* pindex = pindexGenesisBlock;
+      for (const CBlockIndex* pindex = pindexGenesisBlock;
+           pindex; pindex = pindex->pnext)
+        {
+          if (pindex->nHeight % 1000 == 0)
+            printf ("  at height %d...\n", pindex->nHeight);
+
+          CBlock block;
+          block.ReadFromDisk (pindex);
+
+          std::vector<const CTransaction*> vtx;
+          vtx.reserve (block.vtx.size () + block.vgametx.size ());
+          BOOST_FOREACH(const CTransaction& tx, block.vtx)
+            {
+              vtx.push_back (&tx);
+            }
+          BOOST_FOREACH(const CTransaction& tx, block.vgametx)
+            {
+              vtx.push_back (&tx);
+            }
+
+          BOOST_FOREACH(const CTransaction* tx, vtx)
+            {
+              for (unsigned i = 0; i < tx->vin.size (); ++i)
+                if (!tx->vin[i].prevout.IsNull ())
+                  {
+                    const uint256& prevHash = tx->vin[i].prevout.hash;
+
+                    if (txindex.find (prevHash) == txindex.end ())
+                      return error ("RewriteTxIndex: Failed to find prev tx");
+                    txindex[prevHash].SetSpent (tx->vin[i].prevout.n, *tx);
+                  }
+            }
+        }
+
+      BOOST_FOREACH(const PAIRTYPE(uint256, CTxIndex)& item, txindex)
+        {
+          for (unsigned i = 0; i < item.second.GetOutputCount (); ++i)
+            if (item.second.GetSpent (i) == CTxIndex::SPENT_UNKNOWN)
+              return error ("RewriteTxIndex: Still unknown spent type");
+        }
+    }
+
+  /* Now write everything back.  */
+  printf ("Writing everything back...\n");
+  unsigned count = 0;
+  const unsigned totalCount = txindex.size ();
+  SetSerialisationVersion (VERSION);
+  BOOST_FOREACH(const PAIRTYPE(uint256, CTxIndex)& item, txindex)
+    {
+      if (!UpdateTxIndex (item.first, item.second))
+        return error ("RewriteTxIndex: UpdateTxIndex failed");
+
+      ++count;
+      if (count % 100000 == 0)
+        printf ("  %dk / %dk tx done...\n", count / 1000, totalCount / 1000);
+    }
+
+  return true;
 }
 
 
@@ -726,7 +936,7 @@ void ThreadFlushWalletDB(void* parg)
     int64 nLastWalletUpdate = GetTime();
     while (!fShutdown)
     {
-        Sleep(500);
+        MilliSleep(500);
 
         if (nLastSeen != nWalletDBUpdated)
         {
@@ -808,7 +1018,7 @@ bool BackupWallet(const CWallet& wallet, const string& strDest)
                 }
             }
         }
-        Sleep(100);
+        MilliSleep(100);
     }
     return false;
 }

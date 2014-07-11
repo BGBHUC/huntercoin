@@ -52,6 +52,13 @@
          </widget>
         </item>
         <item>
+         <widget class="QLabel" name="gameCoord">
+          <property name="text">
+           <string notr="true">(x,y)</string>
+          </property>
+         </widget>
+        </item>        
+        <item>
          <layout class="QHBoxLayout" name="horizontalLayoutTop">
           <item>
            <widget class="QPushButton" name="newButton">
