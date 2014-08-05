@@ -108,9 +108,10 @@ void UnregisterWallet(CWallet* pwalletIn);
 /** Push an updated transaction to all registered wallets */
 void SyncWithWallets(const CTransaction& tx, const CBlock* pblock = NULL, bool fUpdate = false);
 bool ProcessBlock(CNode* pfrom, CBlock* pblock);
-bool CheckDiskSpace(uint64 nAdditionalBytes=0);
+bool CheckDiskSpace (uint64 nAdditionalBytes = 0);
 FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszMode="rb");
-FILE* AppendBlockFile(unsigned int& nFileRet);
+FILE* AppendBlockFile (DatabaseSet& dbset, unsigned int& nFileRet,
+                       unsigned size);
 void FlushBlockFile(FILE *f);
 bool LoadBlockIndex(bool fAllowNew=true);
 void PrintBlockTree();
@@ -398,11 +399,9 @@ public:
         SetNull();
     }
 
-    CTxOut(int64 nValueIn, CScript scriptPubKeyIn)
-    {
-        nValue = nValueIn;
-        scriptPubKey = scriptPubKeyIn;
-    }
+    inline CTxOut (int64 nValueIn, const CScript& scriptPubKeyIn)
+      : nValue(nValueIn), scriptPubKey (scriptPubKeyIn)
+    {}
 
     IMPLEMENT_SERIALIZE
     (
@@ -448,6 +447,51 @@ public:
     {
         printf("%s\n", ToString().c_str());
     }
+};
+
+/**
+ * An entry in the UTXO set.  This is basically a CTxOut, but it also
+ * contains other information that is needed in ConnectInputs
+ * for checking validity of spending the output.
+ */
+class CUtxoEntry : public CTxOut
+{
+public:
+
+  CTxOut txo;
+  int height;
+  bool isCoinbase;
+  bool isGameTx;
+
+public:
+
+  inline CUtxoEntry ()
+    : CTxOut()
+  {}
+
+  CUtxoEntry (const CTransaction& tx, unsigned n, int h);
+  
+  IMPLEMENT_SERIALIZE
+  (
+    READWRITE (txo);
+    READWRITE (height);
+    READWRITE (isCoinbase);
+    READWRITE (isGameTx);
+  )
+
+  friend inline bool
+  operator== (const CUtxoEntry& a, const CUtxoEntry& b)
+  {
+    return (a.txo == b.txo && a.height == b.height
+            && a.isCoinbase == b.isCoinbase && a.isGameTx == b.isGameTx);
+  }
+
+  friend inline bool
+  operator!= (const CUtxoEntry& a, const CUtxoEntry& b)
+  {
+    return !(a == b);
+  }
+
 };
 
 
@@ -888,7 +932,10 @@ public:
     {
         return !(a == b);
     }
-    int GetDepthInMainChain() const;
+
+    const CBlockIndex* GetContainingBlock () const;
+    int GetHeight () const;
+    int GetDepthInMainChain () const;
 };
 
 

@@ -3,6 +3,7 @@
 #include "../gamestate.h"
 #include "../gamemap.h"
 #include "../util.h"
+
 #include <QImage>
 #include <QGraphicsItem>
 #include <QGraphicsSimpleTextItem>
@@ -681,12 +682,14 @@ void GameMapView::mouseMoveEvent(QMouseEvent *event)
         verticalScrollBar()->setValue(verticalScrollBar()->value() + pan_pos.y() - event->pos().y());
         pan_pos = event->pos();
     }
+	// BGB HUC ////////////////////////
 	QPoint p = mapToScene(event->pos()).toPoint();
 	int x = p.x() / TILE_SIZE;
 	int y = p.y() / TILE_SIZE;
     if (IsInsideMap(x, y)) {
     	emit tileHover(x, y);
     }
+	////////////////////////////////////
     event->accept();
 }
 

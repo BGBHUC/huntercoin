@@ -55,6 +55,8 @@ map<uint256, CDataStream*> mapOrphanTransactions;
 multimap<uint256, CDataStream*> mapOrphanTransactionsByPrev;
 
 const std::string strMessageMagic = "Bitcoin Signed Message:\n";
+static const unsigned BLOCKFILE_MAX_SIZE = 0x7F000000;
+static const unsigned BLOCKFILE_CHUNK_SIZE = 16 * (1 << 20);
 
 double dHashesPerSec;
 int64 nHPSTimerStart;
@@ -203,6 +205,20 @@ void static EraseOrphanTx(uint256 hash)
     mapOrphanTransactions.erase(hash);
 }
 
+
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// Transaction inputs and outputs
+//
+
+
+
+CUtxoEntry::CUtxoEntry (const CTransaction& tx, unsigned n, int h)
+  : txo(tx.vout[n]), height(h),
+    isCoinbase(tx.IsCoinBase ()),
+    isGameTx(tx.IsGameTx ())
+{}
 
 
 
@@ -682,20 +698,40 @@ CTxIndex::GetSpentType (const CTransaction& tx)
   return SPENT_TX;
 }
 
-int CTxIndex::GetDepthInMainChain() const
+const CBlockIndex*
+CTxIndex::GetContainingBlock () const
 {
     // Read block header
     CBlock block;
     if (!block.ReadFromDisk(pos.nBlockFile, pos.nBlockPos, false))
-        return 0;
+        return NULL;
+
     // Find the block in the index
     map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(block.GetHash());
     if (mi == mapBlockIndex.end())
-        return 0;
-    CBlockIndex* pindex = (*mi).second;
-    if (!pindex || !pindex->IsInMainChain())
-        return 0;
-    return 1 + nBestHeight - pindex->nHeight;
+        return NULL;
+
+    return mi->second;
+}
+
+int
+CTxIndex::GetHeight () const
+{
+  const CBlockIndex* pindex = GetContainingBlock ();
+  if (!pindex)
+    return -1;
+
+  return pindex->nHeight;
+}
+
+int
+CTxIndex::GetDepthInMainChain () const
+{
+  const CBlockIndex* pindex = GetContainingBlock ();
+  if (!pindex || !pindex->IsInMainChain ())
+    return 0;
+
+  return 1 + nBestHeight - pindex->nHeight;
 }
 
 
@@ -973,6 +1009,8 @@ void static InvalidChainFound(CBlockIndex* pindexNew)
 bool
 CTransaction::DisconnectInputs (DatabaseSet& dbset, CBlockIndex* pindex)
 {
+    /* FIXME: Implement updating of the UTXO DB.  */
+
     if (!hooks->DisconnectInputs (dbset, *this, pindex))
         return false;
 
@@ -1003,12 +1041,29 @@ CTransaction::DisconnectInputs (DatabaseSet& dbset, CBlockIndex* pindex)
             // Write back
             if (!dbset.tx ().UpdateTxIndex (prevout.hash, txindex))
                 return error("DisconnectInputs() : UpdateTxIndex failed");
+
+            /* Put the previous txo back to the UTXO set.  This requires loading
+               the transaction from disk first.  We could avoid that by keeping
+               "not too old" UTXO entries somewhere, but for now this
+               should do well enough.  DisconnectInputs shouldn't happen
+               too much during normal operation anyway.  */
+            CTransaction txPrev;
+            if (!txPrev.ReadFromDisk (txindex.pos))
+              return error ("DisconnectInputs: %s ReadFromDisk"
+                            " prev tx %s failed",
+                            GetHash ().ToString ().c_str (),
+                            prevout.hash.ToString ().c_str ());
+            if (!dbset.utxo ().InsertUtxo (txPrev, prevout.n,
+                                           txindex.GetHeight ()))
+              return error ("DisconnectInputs: Failed to InsertUtxo");
         }
     }
 
     // Remove transaction from index
+    if (!dbset.utxo ().RemoveUtxo (*this))
+      return error ("DisconnectInputs: Failed to RemoveUtxo");
     if (!dbset.tx ().EraseTxIndex (*this))
-        return error("DisconnectInputs() : EraseTxPos failed");
+      return error ("DisconnectInputs: EraseTxPos failed");
 
     return true;
 }
@@ -1105,13 +1160,12 @@ CTransaction::ConnectInputs (DatabaseSet& dbset,
     // Take over previous transactions' spent pointers
     if (!IsCoinBase())
     {
-        vector<CTransaction> vTxPrev;
-        vector<CTxIndex> vTxindex;
+        std::vector<CUtxoEntry> vTxoPrev;
 
         int64 nValueIn = 0;
         for (int i = 0; i < vin.size(); i++)
         {
-            COutPoint prevout = vin[i].prevout;
+            const COutPoint prevout = vin[i].prevout;
             CTxIndex txindex;
 
             /* Get the previous txindex if we have a prevout.  */
@@ -1164,69 +1218,81 @@ CTransaction::ConnectInputs (DatabaseSet& dbset,
                     return error ("ConnectInputs() : prevout is null for"
                                   " non-game and non-coinbase transaction");
 
-                /* Read txPrev.  This is only used for non-game transactions,
-                   as game tx can be processed in ConnectInputsGameTx
-                   without previous transactions.  */
-                CTransaction txPrev;
+                /* Read the previous input from either the memory
+                   pool or the UTXO set.  */
+                CUtxoEntry txo;
                 if (!fFound || txindex.pos == CDiskTxPos(1,1,1))
                 {
                     // Get prev tx from single transactions in memory
                     CRITICAL_BLOCK(cs_mapTransactions)
                     {
+                        CTransaction txPrev;
                         if (!mapTransactions.count(prevout.hash))
                             return error("ConnectInputs() : %s mapTransactions prev not found %s", GetHashForLog (), prevout.hash.ToLogString ());
+
                         txPrev = mapTransactions[prevout.hash];
+                        if (prevout.n >= txPrev.vout.size ())
+                          return error ("ConnectInputs() : %s prevout.n %d out"
+                                        " of range %d prev tx %s\n%s",
+                                        GetHashForLog (),
+                                        prevout.n, txPrev.vout.size (),
+                                        prevout.hash.ToLogString (),
+                                        txPrev.ToString ().c_str ());
+
+                        txo = CUtxoEntry(txPrev, prevout.n,
+                                         pindexBlock->nHeight);
                     }
                 }
                 else
                 {
-                    // Get prev tx from disk
-                    if (!txPrev.ReadFromDisk(txindex.pos))
-                        return error("ConnectInputs() : %s ReadFromDisk prev tx %s failed", GetHashForLog (),  prevout.hash.ToLogString ());
+                    /* Read the UTXO set.  */
+                    if (!dbset.utxo ().ReadUtxo (prevout, txo))
+                      return error ("ConnectInputs () : %s failed to find prev"
+                                    "out %s in UTXO set",
+                                    GetHash ().ToLogString (),
+                                    prevout.ToString ().c_str ());
                 }
 
-                if (prevout.n >= txPrev.vout.size())
-                    return error ("ConnectInputs() : %s prevout.n %d out of"
-                                  " range %d prev tx %s\n%s",
-                                  GetHashForLog (),
-                                  prevout.n, txPrev.vout.size (),
-                                  prevout.hash.ToLogString (),
-                                  txPrev.ToString ().c_str ());
+                /* Get height difference between the output and the
+                   current block.  This is used to check for maturity
+                   later, and it depends on whether or not the prevout
+                   is already in some confirmed block.  */
+                const int heightDiff = pindexBlock->nHeight - txo.height;
+                if (heightDiff < 0)
+                  return error ("ConnectInputs: height difference is negative");
 
-                // If prev is coinbase, check that it's matured
-                if (txPrev.IsCoinBase())
-                {
-                    for (CBlockIndex* pindex = pindexBlock; pindex->pprev && pindexBlock->nHeight - pindex->nHeight < COINBASE_MATURITY; pindex = pindex->pprev)
-                        if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nBlockFile)
-                            return error("ConnectInputs() : tried to spend coinbase at depth %d", pindexBlock->nHeight - pindex->nHeight);
-                }
-                else if (txPrev.IsGameTx())
-                {
-                    for (CBlockIndex* pindex = pindexBlock; pindex->pprev && pindexBlock->nHeight - pindex->nHeight < GAME_REWARD_MATURITY; pindex = pindex->pprev)
-                        if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nBlockFile)
-                            return error("ConnectInputs() : tried to spend game reward at depth %d", pindexBlock->nHeight - pindex->nHeight);
-                }
+                /* If prev is coinbase or a game tx, check that it's matured.
+                   The premine coins are an exception.  */
+                if (txo.isCoinbase && txo.height > 0)
+                  {
+                    if (heightDiff < COINBASE_MATURITY)
+                      return error ("ConnectInputs: tried to spend coinbase at"
+                                    " depth %d", heightDiff);
+                  }
+                else if (txo.isGameTx)
+                  {
+                    if (heightDiff < GAME_REWARD_MATURITY)
+                      return error ("ConnectInputs: tried to spend game reward"
+                                    " at depth %d", heightDiff);
+                  }
 
                 // Verify signature
-                if (!VerifySignature(txPrev, *this, i))
+                if (!VerifySignature (txo.txo, *this, i))
                     return error("ConnectInputs() : %s VerifySignature failed", GetHash().ToString().substr(0,10).c_str());
 
                 // Check for negative or overflow input values
-                nValueIn += txPrev.vout[prevout.n].nValue;
-                if (!MoneyRange(txPrev.vout[prevout.n].nValue) || !MoneyRange(nValueIn))
+                nValueIn += txo.txo.nValue;
+                if (!MoneyRange (txo.txo.nValue) || !MoneyRange (nValueIn))
                     return error("ConnectInputs() : txin values out of range");
 
-                /* Fill in vectors with previous transactions.  They are not
+                /* Fill in vectors with previous outputs.  They are not
                    used for game transactions and can thus stay empty
                    for those.  */
-                vTxPrev.push_back (txPrev);
-                vTxindex.push_back (txindex);
+                vTxoPrev.push_back (txo);
             }
 
             /* Mark previous outpoints as spent.  This is only necessary
-               when either fBlock or fMiner.  While the txindex is used
-               later also for vTxindex and the ConnectInputs hook,
-               vSpent is never actually used there.  */
+               when either fBlock or fMiner.  */
             if (!prevout.IsNull () && (fBlock || fMiner))
             {
                 assert (fFound);
@@ -1236,6 +1302,8 @@ CTransaction::ConnectInputs (DatabaseSet& dbset,
                 {
                     if (!dbset.tx ().UpdateTxIndex (prevout.hash, txindex))
                         return error("ConnectInputs() : UpdateTxIndex failed");
+                    if (!dbset.utxo ().RemoveUtxo (prevout))
+                        return error ("ConnectInputs() : RemoveUtxo failed");
                 }
                 else
                 {
@@ -1245,7 +1313,7 @@ CTransaction::ConnectInputs (DatabaseSet& dbset,
             }
         }
 
-        if (!hooks->ConnectInputs (dbset, mapTestPool, *this, vTxPrev, vTxindex,
+        if (!hooks->ConnectInputs (dbset, mapTestPool, *this, vTxoPrev,
                                    pindexBlock, posThisTx, fBlock, fMiner))
             return false;
 
@@ -1266,6 +1334,8 @@ CTransaction::ConnectInputs (DatabaseSet& dbset,
     if (fBlock)
     {
         // Add transaction to disk index
+        if (!dbset.utxo ().InsertUtxo (*this, pindexBlock->nHeight))
+            return error ("ConnectInputs() : failed to InsertUtxo");
         if (!dbset.tx ().AddTxIndex (*this, posThisTx, pindexBlock->nHeight))
             return error("ConnectInputs() : AddTxPos failed");
     }
@@ -1291,30 +1361,30 @@ bool CTransaction::ClientConnectInputs()
         for (int i = 0; i < vin.size(); i++)
         {
             // Get prev tx from single transactions in memory
-            COutPoint prevout = vin[i].prevout;
+            const COutPoint& prevout = vin[i].prevout;
             if (!mapTransactions.count(prevout.hash))
                 return false;
-            CTransaction& txPrev = mapTransactions[prevout.hash];
+            const CTransaction& txPrev = mapTransactions[prevout.hash];
 
             if (prevout.n >= txPrev.vout.size())
                 return false;
+            const CTxOut& txoPrev = txPrev.vout[prevout.n];
 
             // Verify signature
-            if (!VerifySignature(txPrev, *this, i))
+            if (!VerifySignature (txoPrev, *this, i))
                 return error("ConnectInputs() : VerifySignature failed");
 
             ///// this is redundant with the mapNextTx stuff, not sure which I want to get rid of
             ///// this has to go away now that posNext is gone
             // // Check for conflicts
-            // if (!txPrev.vout[prevout.n].posNext.IsNull())
+            // if (!txoPrev.posNext.IsNull())
             //     return error("ConnectInputs() : prev tx already used");
             //
             // // Flag outpoints as used
-            // txPrev.vout[prevout.n].posNext = posThisTx;
+            // txoPrev.posNext = posThisTx;
 
-            nValueIn += txPrev.vout[prevout.n].nValue;
-
-            if (!MoneyRange(txPrev.vout[prevout.n].nValue) || !MoneyRange(nValueIn))
+            nValueIn += txoPrev.nValue;
+            if (!MoneyRange (txoPrev.nValue) || !MoneyRange (nValueIn))
                 return error("ClientConnectInputs() : txin values out of range");
         }
 
@@ -1656,13 +1726,20 @@ bool CBlock::WriteToDisk(unsigned int& nFileRet, unsigned int& nBlockPosRet)
 {
     CRITICAL_BLOCK(cs_AppendBlockFile)
     {
+        DatabaseSet dbset("r+");
+
+        unsigned nSize;
+        unsigned nTotalSize = ::GetSerializeSize (*this, SER_DISK);
+        nTotalSize += sizeof (pchMessageStart) + sizeof (nSize);
+
         // Open history file to append
-        CAutoFile fileout = AppendBlockFile(nFileRet);
+        CAutoFile fileout = AppendBlockFile (dbset, nFileRet, nTotalSize);
         if (!fileout)
             return error("CBlock::WriteToDisk() : AppendBlockFile failed");
+        const unsigned startPos = ftell (fileout);
 
         // Write index header
-        unsigned int nSize = fileout.GetSerializeSize(*this);
+        nSize = fileout.GetSerializeSize(*this);
         fileout << FLATDATA(pchMessageStart) << nSize;
 
         // Write block
@@ -1670,6 +1747,12 @@ bool CBlock::WriteToDisk(unsigned int& nFileRet, unsigned int& nBlockPosRet)
         if (nBlockPosRet == -1)
             return error("CBlock::WriteToDisk() : ftell failed");
         fileout << *this;
+
+        // Check that the total size estimate was correct.
+        const unsigned writtenSize = ftell (fileout) - startPos;
+        if (writtenSize != nTotalSize)
+          return error ("CBlock::WriteToDisk: nTotalSize was wrong: %d / %d",
+                        nTotalSize, writtenSize);
 
         // Flush stdio buffers and commit to disk before returning
         FlushBlockFile(fileout);
@@ -1812,8 +1895,6 @@ bool CBlock::AcceptBlock()
         return error("AcceptBlock() : rejected by checkpoint lockin at %d", nHeight);
 
     // Write block to history file
-    if (!CheckDiskSpace(::GetSerializeSize(*this, SER_DISK)))
-        return error("AcceptBlock() : out of disk space");
     unsigned int nFile = -1;
     unsigned int nBlockPos = 0;
     if (!WriteToDisk(nFile, nBlockPos))
@@ -1954,7 +2035,8 @@ bool static ScanMessageStart(Stream& s)
     }
 }
 
-bool CheckDiskSpace(uint64 nAdditionalBytes)
+bool
+CheckDiskSpace (uint64 nAdditionalBytes)
 {
     uint64 nFreeBytesAvailable = filesystem::space(GetDataDir()).available;
 
@@ -1997,25 +2079,88 @@ FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszM
 
 static unsigned int nCurrentBlockFile = 1;
 
-FILE* AppendBlockFile(unsigned int& nFileRet)
+/* Append to a splitting block history file.  The given size is the number of
+   bytes that will be written.  This is used to check for disk space as well
+   as extend the file in preallocated chunks to combat fragmentation.  */
+FILE*
+AppendBlockFile (DatabaseSet& dbset, unsigned int& nFileRet, unsigned size)
 {
+    CTxDB& txdb = dbset.tx ();
+
+    if (!CheckDiskSpace (size))
+      {
+        printf ("ERROR: AppendBlockFile: out of disk space");
+        return NULL;
+      }
+    if (fDebug)
+      printf ("AppendBlockFile: adding %u bytes\n", size);
+
+    FILE* file = NULL;
     nFileRet = 0;
     loop
     {
-        FILE* file = OpenBlockFile(nCurrentBlockFile, 0, "ab");
+        /* We want to open the file in "r+" mode, so that we can write
+           not only at the end (so that overwriting reserved bytes is possible).
+           Make sure the file exists first.  */
+        file = OpenBlockFile (nCurrentBlockFile, 0, "ab");
+        fclose (file);
+        file = OpenBlockFile (nCurrentBlockFile, 0, "rb+");
         if (!file)
-            return NULL;
-        if (fseek(file, 0, SEEK_END) != 0)
-            return NULL;
-        // FAT32 filesize max 4GB, fseek and ftell max 2GB, so we must stay under 2GB
-        if (ftell(file) < 0x7F000000 - MAX_SIZE)
-        {
-            nFileRet = nCurrentBlockFile;
-            return file;
-        }
+          goto error;
+
+        /* reserved should be an int, since otherwise -reserved below
+           fails and the fseek has a wrong effect.  */
+        int reserved = txdb.ReadBlockFileReserved (nCurrentBlockFile);
+        if (size <= reserved)
+          {
+            if (fseek (file, -reserved, SEEK_END) != 0)
+              goto error;
+            reserved -= size;
+            if (!txdb.WriteBlockFileReserved (nCurrentBlockFile, reserved))
+              goto error;
+            break;
+          }
+
+        if (fseek (file, 0, SEEK_END) != 0)
+          goto error;
+        const unsigned fileSize = ftell (file);
+        assert (fileSize >= reserved);
+        const unsigned addedChunk = std::max (BLOCKFILE_CHUNK_SIZE,
+                                              size - reserved);
+
+        if (fileSize + addedChunk <= BLOCKFILE_MAX_SIZE)
+          {
+            std::vector<char> buf(addedChunk, '\0');
+            const unsigned written = fwrite (&buf[0], 1, addedChunk, file);
+            if (written != addedChunk)
+              {
+                printf ("ERROR: AppendBlockFile: write to extend"
+                        " by %u bytes failed, only %u written\n",
+                        addedChunk, written);
+                goto error;
+              }
+            printf ("Block file extended by %u bytes.\n", written);
+              
+            reserved += addedChunk;
+            if (fseek (file, -reserved, SEEK_END) != 0)
+              goto error;
+            reserved -= size;
+            if (!txdb.WriteBlockFileReserved (nCurrentBlockFile, reserved))
+              goto error;
+            break;
+          }
+
         fclose(file);
         nCurrentBlockFile++;
     }
+
+    nFileRet = nCurrentBlockFile;
+    return file;
+
+error:
+    if (file)
+      fclose (file);
+    return NULL;
 }
 
 void FlushBlockFile(FILE *f)

@@ -648,10 +648,10 @@ CNode* ConnectNode(CAddress addrConnect, int64 nTimeout)
     }
 
     /// debug print
-    //printf("trying connection %s lastseen=%.1fhrs lasttry=%.1fhrs\n",
-    //    addrConnect.ToString().c_str(),
-     //   (double)(addrConnect.nTime - GetAdjustedTime())/3600.0,
-      //  (double)(addrConnect.nLastTry - GetAdjustedTime())/3600.0);
+    printf("trying connection %s lastseen=%.1fhrs lasttry=%.1fhrs\n",
+        addrConnect.ToString().c_str(),
+        (double)(addrConnect.nTime - GetAdjustedTime())/3600.0,
+        (double)(addrConnect.nLastTry - GetAdjustedTime())/3600.0);
 
     CRITICAL_BLOCK(cs_mapAddresses)
         mapAddresses[addrConnect.GetKey()].nLastTry = GetAdjustedTime();
@@ -661,7 +661,7 @@ CNode* ConnectNode(CAddress addrConnect, int64 nTimeout)
     if (ConnectSocket(addrConnect, hSocket))
     {
         /// debug print
-        //printf("connected %s\n", addrConnect.ToString().c_str());
+        printf("connected %s\n", addrConnect.ToString().c_str());
 
         // Set to nonblocking
 #ifdef __WXMSW__

@@ -33,7 +33,6 @@ std::string stringFromVch(const std::vector<unsigned char> &vch);
 std::vector<unsigned char> vchFromString(const std::string &str);
 int GetTxPosHeight(const CNameIndex& txPos);
 int GetTxPosHeight(const CDiskTxPos& txPos);
-int GetTxPosHeight2(const CDiskTxPos& txPos, int nHeight);
 CScript RemoveNameScriptPrefix(const CScript& scriptIn);
 bool NameAvailable (DatabaseSet& dbset, const vchType& vchName);
 bool GetTxOfName(CNameDB& dbName, const std::vector<unsigned char> &vchName, CTransaction& tx);
@@ -68,7 +67,7 @@ bool IsValidPlayerName (const std::string& player);
 extern boost::mutex mut_currentState;
 extern boost::condition_variable cv_stateChange;
 
-// BRYHARDT ///////////
+// BGB HUC ///////////
 json_spirit::Value name_pending(const json_spirit::Array& params, bool fHelp);
 json_spirit::Value deletetransaction(const json_spirit::Array& params, bool fHelp);
 ///////////////////////

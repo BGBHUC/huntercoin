@@ -18,6 +18,7 @@ using namespace boost;
 void rescanfornames();
 
 CWallet* pwalletMain;
+string walletPath;
 
 //////////////////////////////////////////////////////////////////////////////
 //
@@ -378,6 +379,14 @@ bool AppInit2(int argc, char* argv[])
     strErrors = "";
     int64 nStart;
 
+    /* Start the RPC server already here.  This is to make it available
+       "immediately" upon starting the daemon process.  Until everything
+       is initialised, it will always just return a "status error" and
+       not try to access the uninitialised stuff.  */
+    if (fServer)
+        CreateThread(ThreadRPCServer, NULL);
+
+    rpcWarmupStatus = "loading addresses";
     printf("Loading addresses...\n");
     nStart = GetTimeMillis();
     if (!LoadAddresses())
@@ -398,28 +407,59 @@ bool AppInit2(int argc, char* argv[])
       CNameDB dbName("cr+");
     }
 
+    /* Do the same for the UTXO database.  */
+    bool needUtxoRescan = false;
+    {
+      filesystem::path utxofile = filesystem::path(GetDataDir()) / "utxo.dat";
+      if (!filesystem::exists(utxofile))
+        needUtxoRescan = true;
+
+      CUtxoDB db("cr+");
+    }
+
+    /* Load block index.  */
+    rpcWarmupStatus = "loading block index";
     printf("Loading block index...\n");
     nStart = GetTimeMillis();
     if (!LoadBlockIndex())
         strErrors += _("Error loading blkindex.dat      \n");
     printf(" block index %15"PRI64d"ms\n", GetTimeMillis() - nStart);
 
+    /* Now that hte block index is loaded, perform the UTXO
+       set rescan if necessary.  */
+    if (needUtxoRescan)
+      {
+        CUtxoDB db("r+");
+        rpcWarmupStatus = "rescanning for utxo set";
+        db.Rescan ();
+      }
+
+    rpcWarmupStatus = "upgrading game db";
     if (!UpgradeGameDB())
         printf("ERROR: GameDB update failed\n");
 
+    rpcWarmupStatus = "loading wallet";
     printf("Loading wallet...\n");
     nStart = GetTimeMillis();
     bool fFirstRun;
-    pwalletMain = new CWallet("wallet.dat");
+    string argWalletPath = GetArg("-walletpath", "wallet.dat");
+    boost::filesystem::path pathWalletFile(argWalletPath);
+    walletPath = pathWalletFile.string();
+    
+    pwalletMain = new CWallet(walletPath);
     if (!pwalletMain->LoadWallet(fFirstRun))
-        strErrors += _("Error loading wallet.dat      \n");
+      strErrors += "Error loading " + argWalletPath + "      \n";
+    
     printf(" wallet      %15"PRI64d"ms\n", GetTimeMillis() - nStart);
 
     RegisterWallet(pwalletMain);
 
     /* Rescan for name index now if we need to do it.  */
     if (needNameRescan)
-      rescanfornames ();
+      {
+        rpcWarmupStatus = "rescanning for names";
+        rescanfornames ();
+      }
     
     // Read -mininput before -rescan, otherwise rescan will skip transactions
     // lower than the default mininput
@@ -432,12 +472,13 @@ bool AppInit2(int argc, char* argv[])
         }
     }
 
+    rpcWarmupStatus = "rescanning blockchain";
     CBlockIndex *pindexRescan = pindexBest;
     if (GetBoolArg("-rescan"))
         pindexRescan = pindexGenesisBlock;
     else
     {
-        CWalletDB walletdb("wallet.dat");
+        CWalletDB walletdb(walletPath);
         CBlockLocator locator;
         if (walletdb.ReadBestBlock(locator))
             pindexRescan = locator.GetBlockIndex();
@@ -468,6 +509,7 @@ bool AppInit2(int argc, char* argv[])
     }
 
     // Add wallet transactions that aren't already in a block to mapTransactions
+    rpcWarmupStatus = "reaccept wallet transactions";
     pwalletMain->ReacceptWalletTransactions();
 
     //
@@ -577,8 +619,9 @@ bool AppInit2(int argc, char* argv[])
     if (!CreateThread(StartNode, NULL))
         wxMessageBox("Error: CreateThread(StartNode) failed", "Huntercoin");
 
-    if (fServer)
-        CreateThread(ThreadRPCServer, NULL);
+    /* We're done initialising, from now on, the RPC daemon
+       can work as usual.  */
+    rpcWarmupStatus = NULL;
 
 #if defined(__WXMSW__) && defined(GUI)
     if (fFirstRun)
@@ -599,6 +642,7 @@ std::string HelpMessage()
     std::string strUsage = std::string(_("Options:\n")) +
         "  -conf=<file>     \t\t  " + _("Specify configuration file (default: huntercoin.conf)\n") +
         "  -pid=<file>      \t\t  " + _("Specify pid file (default: huntercoind.pid)\n") +
+        "  -walletpath=<file> \t  " + _("Specify the wallet filename (default: wallet.dat)") + "\n" +
         "  -gen             \t\t  " + _("Generate coins\n") +
         "  -gen=0           \t\t  " + _("Don't generate coins\n") +
         "  -min             \t\t  " + _("Start minimized\n") +

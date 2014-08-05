@@ -39,6 +39,9 @@ std::map<int,BotMove> Bot::getGatherCoords(const Game::PlayerState &playerState,
 			if (debug == 1) printf("HAVE LOOT ALREADY ON WAY HOME -- ");
 			continue;
 		}
+
+
+
 		if (botTargets[charState.first].targetName.find("!LOOT ") != std::string::npos) {
 			if (debug == 1) printf("CHECKING TARGETED LOOT CHAR %d -- ",charState.first);
 			if (BotHelper::isLootAt(gameState,botTargets[charState.first].coord)) {
@@ -70,6 +73,9 @@ std::map<int,BotMove> Bot::getGatherCoords(const Game::PlayerState &playerState,
 		botState.mode = mode;
 		botState.index = charState.first;
 		BotTarget lootTarget;
+
+
+
 		if (BotHelper::getDistance(charState.second.coord,dests[destIdx]) > BotHelper::getLinear(maxLootDistanceAtDest)) {
 			if (maxLootDistanceInRoute > 0) {
 				if (debug == 1) printf("OUTSIDE DESTINATION SEARCH LOOT %d -- ",maxLootDistanceInRoute);

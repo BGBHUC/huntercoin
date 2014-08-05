@@ -92,6 +92,7 @@ std::string BotHelper::to_string(int number) {
 std::string BotHelper::coordToString(Game::Coord coord) {
 	return BotHelper::to_string(coord.x)+"-"+BotHelper::to_string(coord.y);
 }
+
 BotTarget BotHelper::getClosestLoot(const Game::GameState &gameState,const BotState &botState,std::map<std::string,BotTarget> &myTargets,double within) {
 	BotTarget target;
 	BOOST_FOREACH(const PAIRTYPE(Game::Coord, Game::LootInfo) &p, gameState.loot)    {
